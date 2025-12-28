@@ -6,6 +6,33 @@
 (() => {
   const p = String(location.pathname || '');
   const isDraftDetail = p === '/d' || p.startsWith('/d/');
+  const ULTRA_MODE_KEY = 'SCT_ULTRA_MODE_V1';
+
+  function writeUltraModeToLocalStorage(enabled) {
+    try {
+      localStorage.setItem(ULTRA_MODE_KEY, JSON.stringify({ enabled: !!enabled, setAt: Date.now() }));
+    } catch {}
+  }
+
+  async function syncUltraModePreference() {
+    try {
+      const stored = await chrome.storage.local.get(ULTRA_MODE_KEY);
+      const enabled = !!stored[ULTRA_MODE_KEY];
+      writeUltraModeToLocalStorage(enabled);
+      try {
+        window.dispatchEvent(new CustomEvent('sct_ultra_mode', { detail: { enabled } }));
+      } catch {}
+    } catch {}
+  }
+
+  syncUltraModePreference();
+  try {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== 'local') return;
+      if (!changes || !Object.prototype.hasOwnProperty.call(changes, ULTRA_MODE_KEY)) return;
+      syncUltraModePreference();
+    });
+  } catch {}
 
   function injectPageScript(filename, next) {
     try {

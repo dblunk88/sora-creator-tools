@@ -531,7 +531,9 @@
   ];
 
   const GENS_COUNT_MIN = 1;
-  const GENS_COUNT_MAX = 10;
+  const GENS_COUNT_MAX_DEFAULT = 10;
+  const GENS_COUNT_MAX_ULTRA = 40;
+  const ULTRA_MODE_KEY = 'SCT_ULTRA_MODE_V1';
 
   function safeJsonParse(str) {
     try {
@@ -541,15 +543,33 @@
     }
   }
 
+  function loadUltraModeFromStorage() {
+    try {
+      const raw = localStorage.getItem(ULTRA_MODE_KEY);
+      if (!raw) return false;
+      const parsed = safeJsonParse(raw);
+      if (parsed && typeof parsed === 'object') return !!parsed.enabled;
+      if (typeof raw === 'string') return raw === '1' || raw === 'true';
+      return !!raw;
+    } catch {
+      return false;
+    }
+  }
+
+  function getGensCountMax() {
+    return loadUltraModeFromStorage() ? GENS_COUNT_MAX_ULTRA : GENS_COUNT_MAX_DEFAULT;
+  }
+
   function clampGensCount(value) {
     const n = Number(value);
     if (!Number.isFinite(n)) return GENS_COUNT_MIN;
-    return Math.min(GENS_COUNT_MAX, Math.max(GENS_COUNT_MIN, Math.round(n)));
+    const max = getGensCountMax();
+    return Math.min(max, Math.max(GENS_COUNT_MIN, Math.round(n)));
   }
 
   function getGensFillPercent(value) {
     const n = clampGensCount(value);
-    const range = GENS_COUNT_MAX - GENS_COUNT_MIN;
+    const range = getGensCountMax() - GENS_COUNT_MIN;
     if (range <= 0) return 100;
     const pct = ((n - GENS_COUNT_MIN) / range) * 100;
     return Math.min(100, Math.max(0, pct));
@@ -569,6 +589,13 @@
 
   function syncGensControlUI() {
     try {
+      const max = getGensCountMax();
+      if (gensCount > max) {
+        gensCount = max;
+        try {
+          localStorage.setItem(GENS_COUNT_KEY, JSON.stringify({ count: max, setAt: Date.now() }));
+        } catch {}
+      }
       const controls = document.querySelectorAll('[data-sct-gens-control="1"]');
       controls.forEach((control) => {
         const labelEl = control.querySelector('[data-sct-gens-label="1"]');
@@ -576,7 +603,12 @@
         const valueEl = control.querySelector('[data-sct-gens-value="1"]');
         if (valueEl) valueEl.textContent = String(gensCount);
         const slider = control.querySelector('input[type="range"][data-sct-gens-slider="1"]');
-        if (slider) slider.value = String(gensCount);
+        if (slider) {
+          slider.max = String(max);
+          slider.value = String(gensCount);
+        }
+        const maxLabel = control.querySelector('[data-sct-gens-max="1"]');
+        if (maxLabel) maxLabel.textContent = String(max);
         const fill = control.querySelector('[data-sct-gens-fill="1"]');
         if (fill) fill.style.width = `${getGensFillPercent(gensCount)}%`;
       });
@@ -732,6 +764,16 @@
       },
       { passive: true }
     );
+
+    window.addEventListener(
+      'sct_ultra_mode',
+      () => {
+        try {
+          syncGensControlUI();
+        } catch {}
+      },
+      false
+    );
   }
 
   function ensureGensControlStyles() {
@@ -871,7 +913,7 @@
     const slider = document.createElement('input');
     slider.type = 'range';
     slider.min = String(GENS_COUNT_MIN);
-    slider.max = String(GENS_COUNT_MAX);
+    slider.max = String(getGensCountMax());
     slider.step = '1';
     slider.value = String(gensCount);
     slider.dataset.sctGensSlider = '1';
@@ -886,7 +928,8 @@
     minLabel.textContent = String(GENS_COUNT_MIN);
     const maxLabel = document.createElement('span');
     maxLabel.className = 'font-medium';
-    maxLabel.textContent = String(GENS_COUNT_MAX);
+    maxLabel.dataset.sctGensMax = '1';
+    maxLabel.textContent = String(getGensCountMax());
     rangeLabels.appendChild(minLabel);
     rangeLabels.appendChild(maxLabel);
 

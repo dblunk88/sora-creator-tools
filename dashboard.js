@@ -8,6 +8,8 @@
   const TOP_TODAY_WINDOW_MS = 24 * 60 * 60 * 1000;
   const TOP_TODAY_MIN_UNIQUE_VIEWS = 100;
     const TOP_TODAY_MIN_LIKES = 15;
+  const ULTRA_MODE_STORAGE_KEY = 'SCT_ULTRA_MODE_V1';
+  const ULTRA_MODE_TAP_COUNT = 5;
     const SITE_ORIGIN = 'https://sora.chatgpt.com';
   const absUrl = (u, pid) => {
     if (!u && pid) return `${SITE_ORIGIN}/p/${pid}`;
@@ -79,6 +81,40 @@
     if (Math.abs(v) >= 1e6) return (v/1e6).toFixed(2)+'M';
     if (Math.abs(v) >= 1e3) return (v/1e3).toFixed(2)+'K';
     return Math.round(v).toString();
+  }
+
+  let toastTimer = null;
+  function showToast(message){
+    try {
+      let toast = document.getElementById('sctToast');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'sctToast';
+        toast.className = 'sct-toast';
+        document.body.appendChild(toast);
+      }
+      toast.textContent = message;
+      toast.classList.add('show');
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => {
+        toast.classList.remove('show');
+      }, 2000);
+    } catch {}
+  }
+
+  async function loadUltraModePreference(){
+    try {
+      const stored = await chrome.storage.local.get(ULTRA_MODE_STORAGE_KEY);
+      return !!stored[ULTRA_MODE_STORAGE_KEY];
+    } catch {
+      return false;
+    }
+  }
+
+  async function saveUltraModePreference(enabled){
+    try {
+      await chrome.storage.local.set({ [ULTRA_MODE_STORAGE_KEY]: !!enabled });
+    } catch {}
   }
 
   function num(v){ const n = Number(v); return isFinite(n) ? n : 0; }
@@ -3111,6 +3147,24 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
 
   async function main(){
     let metrics = await loadMetrics();
+    let ultraModeEnabled = await loadUltraModePreference();
+    const modeTapEl = $('#dashboardModeTap');
+    if (modeTapEl) {
+      let tapCount = 0;
+      let lastTapAt = 0;
+      modeTapEl.addEventListener('click', async () => {
+        const now = Date.now();
+        if (now - lastTapAt > 1500) tapCount = 0;
+        lastTapAt = now;
+        tapCount += 1;
+        if (tapCount >= ULTRA_MODE_TAP_COUNT) {
+          tapCount = 0;
+          ultraModeEnabled = !ultraModeEnabled;
+          await saveUltraModePreference(ultraModeEnabled);
+          showToast(ultraModeEnabled ? 'Ultra mode unlocked' : 'Ultra mode disabled');
+        }
+      });
+    }
     // Build list and try to restore last user
     let currentUserKey = buildUserOptions(metrics);
     try {
