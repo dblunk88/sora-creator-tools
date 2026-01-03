@@ -62,66 +62,12 @@
   }
 
   // Always inject api.js (request/body rewriter + duration dropdown enhancer).
-  // Keep inject.js (heavy overlays/metrics) disabled on draft detail pages (/d/...) per performance issues.
+  // Inject inject.js on all pages; it self-limits on draft detail routes.
   injectPageScript('api.js', () => {
-    if (!isDraftDetail) injectPageScript('inject.js');
+    injectPageScript('inject.js');
   });
 
-  if (isDraftDetail) return;
-
-  // Listen for metrics snapshots posted from the injected script and persist to storage.
-  (function () {
-  const PENDING = [];
-  let flushTimer = null;
-  const metricsFallback = { users: {} };
-
-  // Debug toggles
-  const DEBUG = { storage: false, thumbs: false };
-  const dlog = (topic, ...args) => { try { if (DEBUG[topic]) console.log('[SoraUV]', topic, ...args); } catch {} };
-
-  const DEFAULT_METRICS = { users: {} };
-
-  function normalizeMetrics(raw) {
-    if (!raw || typeof raw !== 'object') return { ...DEFAULT_METRICS };
-    const users = raw.users;
-    if (!users || typeof users !== 'object' || Array.isArray(users)) return { ...DEFAULT_METRICS };
-    return { ...raw, users };
-  }
-
-  function scheduleFlush() {
-    if (flushTimer) return;
-    flushTimer = setTimeout(flush, 750);
-  }
-
-  function onMessage(ev) {
-    if (ev?.source !== window) return;
-    const d = ev?.data;
-    if (!d || d.__sora_uv__ !== true || d.type !== 'metrics_batch' || !Array.isArray(d.items)) return;
-    for (const it of d.items) PENDING.push(it);
-    scheduleFlush();
-  }
-
-  (function(){
-    function onMetricsRequest(ev){
-      const d = ev?.data;
-      if (!d || d.__sora_uv__ !== true || d.type !== 'metrics_request') return;
-      const req = d.req;
-      (async () => {
-        try {
-          const { metrics: rawMetrics } = await chrome.storage.local.get('metrics');
-          const metrics = normalizeMetrics(rawMetrics);
-          // Reply back into the page
-          window.postMessage({ __sora_uv__: true, type: 'metrics_response', req, metrics }, '*');
-        } catch {
-          // Fall back to an empty payload if storage is unavailable
-          window.postMessage({ __sora_uv__: true, type: 'metrics_response', req, metrics: metricsFallback }, '*');
-        }
-      })();
-    }
-    window.addEventListener('message', onMetricsRequest);
-  })();
-
-  // Listen for dashboard open requests from inject.js and relay to background
+  // Listen for dashboard open requests from inject.js and relay to background.
   let dashboardOpenLock = false;
   let dashboardOpenLockTimer = null;
   function openDashboardTab(opts){
@@ -178,6 +124,304 @@
   document.addEventListener('pointerup', dashboardClickHandler, true);
   document.addEventListener('touchend', dashboardClickHandler, true);
 
+  if (isDraftDetail) return;
+
+  // Listen for metrics snapshots posted from the injected script and persist to storage.
+  (function () {
+  const PENDING = [];
+  let flushTimer = null;
+  const metricsFallback = { users: {} };
+  const METRICS_STORAGE_KEY = 'metrics';
+  const METRICS_UPDATED_AT_KEY = 'metricsUpdatedAt';
+
+  // Debug toggles
+  const DEBUG = { storage: false, thumbs: false };
+  const dlog = (topic, ...args) => { try { if (DEBUG[topic]) console.log('[SoraUV]', topic, ...args); } catch {} };
+
+  const DEFAULT_METRICS = { users: {} };
+  const postIdToUserKey = new Map();
+  let metricsCache = null;
+  let metricsCacheUpdatedAt = 0;
+  let metricsCacheLoading = null;
+
+  function normalizeMetrics(raw) {
+    if (!raw || typeof raw !== 'object') return { ...DEFAULT_METRICS };
+    const users = raw.users;
+    if (!users || typeof users !== 'object' || Array.isArray(users)) return { ...DEFAULT_METRICS };
+    return { ...raw, users };
+  }
+
+  function rebuildPostIndex(metrics) {
+    postIdToUserKey.clear();
+    const users = metrics?.users || {};
+    for (const [userKey, user] of Object.entries(users)) {
+      const posts = user?.posts;
+      if (!posts || typeof posts !== 'object') continue;
+      for (const postId of Object.keys(posts)) {
+        postIdToUserKey.set(postId, userKey);
+      }
+    }
+  }
+
+  function cacheMetrics(rawMetrics, updatedAt) {
+    const normalized = normalizeMetrics(rawMetrics);
+    metricsCache = normalized;
+    metricsCacheUpdatedAt = Number(updatedAt) || 0;
+    rebuildPostIndex(normalized);
+  }
+
+  async function loadMetricsFromStorage() {
+    if (metricsCacheLoading) return metricsCacheLoading;
+    metricsCacheLoading = (async () => {
+      try {
+        const stored = await chrome.storage.local.get([METRICS_STORAGE_KEY, METRICS_UPDATED_AT_KEY]);
+        cacheMetrics(stored[METRICS_STORAGE_KEY], stored[METRICS_UPDATED_AT_KEY]);
+      } catch {
+        metricsCache = normalizeMetrics(null);
+        metricsCacheUpdatedAt = metricsCacheUpdatedAt || 0;
+      } finally {
+        metricsCacheLoading = null;
+      }
+      return { metrics: metricsCache || { users: {} }, metricsUpdatedAt: metricsCacheUpdatedAt || 0 };
+    })();
+    return metricsCacheLoading;
+  }
+
+  async function getMetricsState() {
+    if (metricsCache) {
+      return { metrics: metricsCache, metricsUpdatedAt: metricsCacheUpdatedAt || 0 };
+    }
+    return loadMetricsFromStorage();
+  }
+
+  function toTs(v) {
+    if (typeof v === 'number' && isFinite(v)) return v < 1e11 ? v * 1000 : v;
+    if (typeof v === 'string' && v.trim()) {
+      const s = v.trim();
+      if (/^\d+$/.test(s)) {
+        const n = Number(s);
+        return n < 1e11 ? n * 1000 : n;
+      }
+      const d = Date.parse(s);
+      if (!isNaN(d)) return d;
+    }
+    return 0;
+  }
+
+  function getPostTimeMs(p) {
+    const cands = [p?.post_time, p?.postTime, p?.post?.post_time, p?.post?.postTime, p?.meta?.post_time];
+    for (const c of cands) {
+      const t = toTs(c);
+      if (t) return t;
+    }
+    return 0;
+  }
+
+  function latestSnapshot(snaps) {
+    if (!Array.isArray(snaps) || snaps.length === 0) return null;
+    const last = snaps[snaps.length - 1];
+    if (last?.t != null) return last;
+    let best = null;
+    let bt = -Infinity;
+    for (const s of snaps) {
+      const t = Number(s?.t);
+      if (isFinite(t) && t > bt) {
+        bt = t;
+        best = s;
+      }
+    }
+    return best || last || null;
+  }
+
+  function pickSnapshotFields(snap) {
+    if (!snap || typeof snap !== 'object') return null;
+    return {
+      t: snap.t ?? null,
+      uv: snap.uv ?? null,
+      likes: snap.likes ?? null,
+      views: snap.views ?? null,
+      comments: snap.comments ?? null,
+      remixes: snap.remixes ?? null,
+      remix_count: snap.remix_count ?? snap.remixes ?? null,
+      duration: snap.duration ?? null,
+      width: snap.width ?? null,
+      height: snap.height ?? null,
+    };
+  }
+
+  function trimPostForResponse(post, snapshotMode) {
+    if (!post || typeof post !== 'object') return null;
+    const postTime = getPostTimeMs(post);
+    let snapshots = [];
+    if (snapshotMode === 'all' && Array.isArray(post.snapshots)) {
+      snapshots = post.snapshots.map(pickSnapshotFields).filter(Boolean);
+    } else {
+      const latest = latestSnapshot(post.snapshots);
+      if (latest) {
+        const picked = pickSnapshotFields(latest);
+        if (picked) snapshots = [picked];
+      }
+    }
+    return {
+      url: post.url ?? null,
+      thumb: post.thumb ?? null,
+      caption: typeof post.caption === 'string' ? post.caption : null,
+      text: typeof post.text === 'string' ? post.text : null,
+      ownerKey: post.ownerKey ?? null,
+      ownerHandle: post.ownerHandle ?? null,
+      ownerId: post.ownerId ?? null,
+      userHandle: post.userHandle ?? null,
+      userKey: post.userKey ?? null,
+      post_time: postTime || null,
+      duration: post.duration ?? null,
+      width: post.width ?? null,
+      height: post.height ?? null,
+      cameo_usernames: post.cameo_usernames ?? null,
+      snapshots,
+    };
+  }
+
+  function findPost(metrics, postId) {
+    if (!postId || typeof postId !== 'string') return null;
+    const userKey = postIdToUserKey.get(postId);
+    if (userKey && metrics?.users?.[userKey]?.posts?.[postId]) {
+      return { userKey, post: metrics.users[userKey].posts[postId] };
+    }
+    const users = metrics?.users || {};
+    for (const [uKey, user] of Object.entries(users)) {
+      const posts = user?.posts;
+      if (!posts || typeof posts !== 'object') continue;
+      if (posts[postId]) {
+        postIdToUserKey.set(postId, uKey);
+        return { userKey: uKey, post: posts[postId] };
+      }
+      for (const parentPost of Object.values(posts)) {
+        const remixPostsData = parentPost?.remix_posts;
+        const remixPosts = Array.isArray(remixPostsData)
+          ? remixPostsData
+          : (Array.isArray(remixPostsData?.items) ? remixPostsData.items : []);
+        for (const remixItem of remixPosts) {
+          const remixPost = remixItem?.post || remixItem;
+          const remixId = remixPost?.id || remixPost?.post_id;
+          if (remixId === postId) {
+            postIdToUserKey.set(postId, uKey);
+            return { userKey: uKey, post: remixPost };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function buildAnalyzeMetrics(metrics, windowHours) {
+    const trimmed = { users: {} };
+    const NOW = Date.now();
+    const hours = Math.min(24, Math.max(1, Number(windowHours) || 24));
+    const windowMs = hours * 60 * 60 * 1000;
+    const users = metrics?.users || {};
+    for (const [userKey, user] of Object.entries(users)) {
+      const posts = user?.posts;
+      if (!posts || typeof posts !== 'object') continue;
+      const nextPosts = {};
+      for (const [pid, p] of Object.entries(posts)) {
+        const tPost = getPostTimeMs(p);
+        if (!tPost || NOW - tPost > windowMs) continue;
+        const latest = latestSnapshot(p?.snapshots);
+        if (!latest) continue;
+        const trimmedPost = trimPostForResponse(p, 'latest');
+        if (!trimmedPost) continue;
+        nextPosts[pid] = trimmedPost;
+      }
+      if (Object.keys(nextPosts).length) {
+        trimmed.users[userKey] = {
+          handle: user?.handle ?? user?.userHandle ?? null,
+          userHandle: user?.userHandle ?? user?.handle ?? null,
+          id: user?.id ?? user?.userId ?? null,
+          posts: nextPosts,
+        };
+      }
+    }
+    return trimmed;
+  }
+
+  function buildPostMetrics(metrics, postId, snapshotMode) {
+    const result = { users: {} };
+    const found = findPost(metrics, postId);
+    if (!found) return result;
+    const { userKey, post } = found;
+    const user = metrics?.users?.[userKey] || {};
+    const trimmedPost = trimPostForResponse(post, snapshotMode);
+    if (!trimmedPost) return result;
+    result.users[userKey] = {
+      handle: user?.handle ?? user?.userHandle ?? null,
+      userHandle: user?.userHandle ?? user?.handle ?? null,
+      id: user?.id ?? user?.userId ?? null,
+      posts: { [postId]: trimmedPost },
+    };
+    return result;
+  }
+
+  function buildMetricsForRequest(metrics, req) {
+    const scope = typeof req?.scope === 'string' ? req.scope.toLowerCase() : 'full';
+    if (scope === 'analyze') {
+      return buildAnalyzeMetrics(metrics, req?.windowHours);
+    }
+    if (scope === 'post') {
+      const snapshotMode = req?.snapshotMode === 'all' ? 'all' : 'latest';
+      return buildPostMetrics(metrics, req?.postId, snapshotMode);
+    }
+    return metrics;
+  }
+
+  function scheduleFlush() {
+    if (flushTimer) return;
+    flushTimer = setTimeout(flush, 750);
+  }
+
+  function onMessage(ev) {
+    if (ev?.source !== window) return;
+    const d = ev?.data;
+    if (!d || d.__sora_uv__ !== true || d.type !== 'metrics_batch' || !Array.isArray(d.items)) return;
+    for (const it of d.items) PENDING.push(it);
+    scheduleFlush();
+  }
+
+  (function(){
+    function onMetricsRequest(ev){
+      const d = ev?.data;
+      if (!d || d.__sora_uv__ !== true || d.type !== 'metrics_request') return;
+      const req = d.req;
+      (async () => {
+        try {
+          const { metrics, metricsUpdatedAt } = await getMetricsState();
+          const responseMetrics = buildMetricsForRequest(metrics, d);
+          // Reply back into the page
+          window.postMessage({ __sora_uv__: true, type: 'metrics_response', req, metrics: responseMetrics, metricsUpdatedAt }, '*');
+        } catch {
+          // Fall back to an empty payload if storage is unavailable
+          window.postMessage({ __sora_uv__: true, type: 'metrics_response', req, metrics: metricsFallback, metricsUpdatedAt: 0 }, '*');
+        }
+      })();
+    }
+    window.addEventListener('message', onMetricsRequest);
+  })();
+
+  try {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== 'local' || !changes) return;
+      const hasMetrics = Object.prototype.hasOwnProperty.call(changes, METRICS_STORAGE_KEY);
+      const hasUpdatedAt = Object.prototype.hasOwnProperty.call(changes, METRICS_UPDATED_AT_KEY);
+      if (hasMetrics) {
+        const nextMetrics = changes[METRICS_STORAGE_KEY]?.newValue;
+        const nextUpdatedAt = hasUpdatedAt ? changes[METRICS_UPDATED_AT_KEY]?.newValue : metricsCacheUpdatedAt;
+        cacheMetrics(nextMetrics, nextUpdatedAt);
+      } else if (hasUpdatedAt) {
+        const nextUpdatedAt = Number(changes[METRICS_UPDATED_AT_KEY]?.newValue) || 0;
+        metricsCacheUpdatedAt = nextUpdatedAt || metricsCacheUpdatedAt;
+      }
+    });
+  } catch {}
+
   let isFlushing = false;
   let needsFlush = false;
 
@@ -209,8 +453,7 @@
       // Take current items
       const items = PENDING.splice(0, PENDING.length);
       try {
-        const { metrics: rawMetrics } = await chrome.storage.local.get('metrics');
-        const metrics = normalizeMetrics(rawMetrics);
+        const { metrics } = await getMetricsState();
         dlog('storage', 'flush begin', { count: items.length });
         for (const snap of items) {
           const userKey = snap.userKey || snap.pageUserKey || 'unknown';
@@ -218,6 +461,7 @@
           if (!userEntry.posts || typeof userEntry.posts !== 'object' || Array.isArray(userEntry.posts)) userEntry.posts = {};
           if (!Array.isArray(userEntry.followers)) userEntry.followers = [];
           if (snap.postId) {
+            postIdToUserKey.set(snap.postId, userKey);
             const post = userEntry.posts[snap.postId] || (userEntry.posts[snap.postId] = { url: snap.url || null, thumb: snap.thumb || null, snapshots: [] });
             // Persist owner attribution on the post to allow dashboard integrity checks
             if (!post.ownerKey && (snap.userKey || snap.pageUserKey)) post.ownerKey = snap.userKey || snap.pageUserKey;
@@ -350,10 +594,12 @@
             postCount: Object.keys(user?.posts || {}).length
           }));
           await chrome.storage.local.set({
-            metrics,
-            metricsUpdatedAt,
+            [METRICS_STORAGE_KEY]: metrics,
+            [METRICS_UPDATED_AT_KEY]: metricsUpdatedAt,
             [METRICS_USERS_INDEX_KEY]: usersIndex
           });
+          metricsCache = metrics;
+          metricsCacheUpdatedAt = metricsUpdatedAt;
           // Debug: Verify duration is in the metrics we just saved
           if (DEBUG.storage) {
             const sampleUser = Object.values(metrics.users || {})[0];

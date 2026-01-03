@@ -64,7 +64,7 @@
   <main class="layout">
     <aside class="sidebar">
       <div class="sidebar-scroll">
-        <h3>Select User</h3>
+        <h3>Select Profile</h3>
         <div class="user-select-bar">
           <div class="user-picker">
             <input id="search" type="search" placeholder="Search users..." autocomplete="off" />
@@ -74,23 +74,18 @@
         </div>
         <h3>Filter Posts</h3>
         <div class="list-actions">
-          <button id="showAll" title="Show all posts">Show All</button>
-          <button id="hideAll" title="Hide all posts">Hide All</button>
-          <button id="pastDay" title="Show posts from the past 24 hours">Past Day</button>
-          <button id="pastWeek" title="Show posts from the past 7 days">Past Week</button>
-          <button id="last5" title="Show last 5 posts by time">Past 5</button>
-          <button id="last10" title="Show last 10 posts by time">Past 10</button>
-          <button id="top5" title="Show top 5 posts by likes">Top 5</button>
-          <button id="top10" title="Show top 10 posts by likes">Top 10</button>
-          <button id="bottom5" title="Show 5 least liked posts (excluding last 24 hours)">Bottom 5</button>
-          <button id="bottom10" title="Show 10 least liked posts (excluding last 24 hours)">Bottom 10</button>
-          <button id="stale" title="Show posts whose metrics haven't refreshed in 24h">Stale</button>
-          <button id="saveCustomFilter" class="custom-save-btn">Save</button>
-        </div>
-        <div class="custom-filters">
-          <div class="custom-filters-row list-actions">
-            <div id="customFiltersWrap" class="custom-filters-list" aria-label="Custom filters"></div>
-          </div>
+          <button id="showAll">Show All</button>
+          <button id="hideAll">Hide All</button>
+          <button id="pastDay">Past Day</button>
+          <button id="pastWeek">Past Week</button>
+          <button id="last5">Past 5</button>
+          <button id="last10">Past 10</button>
+          <button id="top5">Top 5</button>
+          <button id="top10">Top 10</button>
+          <button id="bottom5">Bottom 5</button>
+          <button id="bottom10">Bottom 10</button>
+          <button id="stale">Stale</button>
+          <div id="customFiltersWrap" class="custom-filters-list" aria-label="Custom filters"></div>
         </div>
         <div id="posts" class="posts"></div>
       </div>
@@ -140,7 +135,7 @@
                     class="best-time-info"
                     type="button"
                     aria-label="How expected performance is calculated"
-                    data-tooltip="Expected Performance is the historical likes multiple for posts made during this time, adjusted for follower size."
+                    data-tooltip="Expected Performance is the historical likes multiple for all posts made during this window relative to all other posts on Sora, corrected for follower size."
                   >ⓘ</button>
                 </span>
                 <span id="bestTimeLift" class="best-time-mono">—</span>
@@ -156,7 +151,7 @@
             <div class="best-time-heatmap-times" aria-hidden="true">
               <span class="best-time-heatmap-spacer"></span>
               <div class="best-time-heatmap-time-cells">
-                <span class="best-time-heatmap-time">1</span>
+                <span class="best-time-heatmap-time">AM</span>
                 <span class="best-time-heatmap-time">2</span>
                 <span class="best-time-heatmap-time">3</span>
                 <span class="best-time-heatmap-time">4</span>
@@ -168,7 +163,7 @@
                 <span class="best-time-heatmap-time">10</span>
                 <span class="best-time-heatmap-time">11</span>
                 <span class="best-time-heatmap-time">12</span>
-                <span class="best-time-heatmap-time">1</span>
+                <span class="best-time-heatmap-time">PM</span>
                 <span class="best-time-heatmap-time">2</span>
                 <span class="best-time-heatmap-time">3</span>
                 <span class="best-time-heatmap-time">4</span>
@@ -185,8 +180,11 @@
           </div>
         </div>
       </div>
-      <h3 id="metricsHeader" class="section-title section-title-first section-title-metrics">Metrics for —</h3>
-      <p id="metricsGatherNote" class="section-note"><span id="metricsGatherNoteText">Based on all post you've seen from —.</span> <a id="metricsGatherLink" class="best-time-link" href="#">Gather more data.</a></p>
+      <h3 id="metricsHeader" class="section-title section-title-first section-title-metrics">
+        <span id="metricsHeaderText">Metrics for —</span>
+        <span id="metricsAutoRefresh" class="metrics-auto-refresh is-hidden" aria-live="polite"></span>
+      </h3>
+      <p id="metricsGatherNote" class="section-note"><span id="metricsGatherNoteText">Based on all posts you've seen from —.</span> <a id="metricsGatherLink" class="best-time-link" href="#">Gather more data.</a></p>
       <div class="metric-grid">
         <div id="totalViewsSummary" class="metric-card" title="Sum of latest total views for visible posts">
           <span id="totalViewsTotal" class="value">0</span>

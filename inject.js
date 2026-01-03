@@ -1774,7 +1774,14 @@
     // Try to load from storage first
     try {
       const requestId = 'post_data_' + Date.now();
-      window.postMessage({ __sora_uv__: true, type: 'metrics_request', req: requestId }, '*');
+      window.postMessage({
+        __sora_uv__: true,
+        type: 'metrics_request',
+        req: requestId,
+        scope: 'post',
+        postId: sid,
+        snapshotMode: 'latest',
+      }, '*');
       
       // Wait for response
       const responsePromise = new Promise((resolve) => {
@@ -3303,18 +3310,48 @@
   }
 
   let _metricsInFlight = null;
+  let _metricsCache = null;
+  let _metricsCacheUpdatedAt = 0;
+  let _metricsCacheWindowHours = null;
+  let _metricsCacheTs = 0;
+  const METRICS_CACHE_TTL_MS = 2000;
 
-  async function requestStoredMetrics() {
-    if (_metricsInFlight) return _metricsInFlight;
+  async function requestStoredMetrics(opts = {}) {
+    const windowHours = Number(opts.windowHours ?? analyzeWindowHours) || 24;
+    const now = Date.now();
+    if (_metricsCache && _metricsCacheWindowHours === windowHours && now - _metricsCacheTs < METRICS_CACHE_TTL_MS) {
+      return _metricsCache;
+    }
+    if (_metricsInFlight && _metricsInFlight.windowHours === windowHours) {
+      return _metricsInFlight.promise;
+    }
 
-    _metricsInFlight = new Promise((resolve) => {
-      const token = Math.random().toString(36).slice(2);
+    const token = Math.random().toString(36).slice(2);
+    const inFlight = { token, windowHours, promise: null };
+    inFlight.promise = new Promise((resolve) => {
       const onReply = (ev) => {
         const d = ev?.data;
         if (!d || d.__sora_uv__ !== true || d.type !== 'metrics_response' || d.req !== token) return;
         window.removeEventListener('message', onReply);
         const metrics = d.metrics || { users: {} };
-        _metricsInFlight = null;
+        const metricsUpdatedAt = Number(d.metricsUpdatedAt) || 0;
+        if (_metricsInFlight && _metricsInFlight.token === token) _metricsInFlight = null;
+
+        if (
+          _metricsCache &&
+          _metricsCacheWindowHours === windowHours &&
+          metricsUpdatedAt &&
+          metricsUpdatedAt === _metricsCacheUpdatedAt
+        ) {
+          _metricsCacheTs = Date.now();
+          resolve(_metricsCache);
+          return;
+        }
+
+        _metricsCache = metrics;
+        _metricsCacheUpdatedAt = metricsUpdatedAt || _metricsCacheUpdatedAt;
+        _metricsCacheWindowHours = windowHours;
+        _metricsCacheTs = Date.now();
         
         // Debug: Check if duration is in the stored metrics
         if (DEBUG.analyze) {
@@ -3336,19 +3373,32 @@
         resolve(metrics);
       };
       window.addEventListener('message', onReply);
-      window.postMessage({ __sora_uv__: true, type: 'metrics_request', req: token }, '*');
+      window.postMessage({
+        __sora_uv__: true,
+        type: 'metrics_request',
+        req: token,
+        scope: 'analyze',
+        windowHours,
+        snapshotMode: 'latest',
+      }, '*');
       setTimeout(() => {
         // timeout safety
         window.removeEventListener('message', onReply);
-        _metricsInFlight = null;
+        if (_metricsInFlight && _metricsInFlight.token === token) _metricsInFlight = null;
+        if (_metricsCache && _metricsCacheWindowHours === windowHours) {
+          _metricsCacheTs = Date.now();
+          resolve(_metricsCache);
+          return;
+        }
         resolve({ users: {} });
       }, 2000);
     });
-    return _metricsInFlight;
+    _metricsInFlight = inFlight;
+    return inFlight.promise;
   }
 
   async function collectCameoUsernamesFromStorage() {
-    const metrics = await requestStoredMetrics();
+    const metrics = await requestStoredMetrics({ windowHours: analyzeWindowHours });
     const NOW = Date.now();
     const windowHours = Number(analyzeWindowHours) || 24;
     const WINDOW_MS = windowHours * 60 * 60 * 1000;
@@ -3404,7 +3454,7 @@
   }
 
   async function collectAnalyzeRowsFromStorage() {
-    const metrics = await requestStoredMetrics();
+    const metrics = await requestStoredMetrics({ windowHours: analyzeWindowHours });
     const rows = [];
     const NOW = Date.now();
     const windowHours = Number(analyzeWindowHours) || 24;
@@ -4830,6 +4880,20 @@ async function renderAnalyzeTable(force = false) {
     }
   }
 
+  function looksLikeProfile(json) {
+    try {
+      const p = json?.profile || json?.owner_profile || json?.data?.profile || json;
+      if (!p || typeof p !== 'object') return false;
+      if (p.user_id != null || p.id != null) return true;
+      if (typeof p.username === 'string' && p.username) return true;
+      if (typeof p.handle === 'string' && p.handle) return true;
+      if (p.cameo_count != null || p.follower_count != null) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   function looksLikePostDetail(json) {
     try {
       // Post detail has structure: { post: {...}, profile: {...}, remix_posts: {...}, ancestors: {...} }
@@ -4973,6 +5037,8 @@ async function renderAnalyzeTable(force = false) {
                 } else if (looksLikeSoraFeed(j)) {
                   dlog('feed', 'fetch autodetected feed', { url, items: (j?.items || j?.data?.items || []).length });
                   processFeedJson(j);
+                } else if (looksLikeProfile(j)) {
+                  processProfileJson(j);
                 }
               })
               .catch(() => {});
@@ -5055,6 +5121,8 @@ async function renderAnalyzeTable(force = false) {
                   } else if (looksLikeSoraFeed(j)) {
                     dlog('feed', 'xhr autodetected feed', { url, items: (j?.items || j?.data?.items || []).length });
                     processFeedJson(j);
+                  } else if (looksLikeProfile(j)) {
+                    processProfileJson(j);
                   }
                 }
               } catch {}
@@ -5064,6 +5132,80 @@ async function renderAnalyzeTable(force = false) {
       });
       return origOpen.apply(this, arguments);
     };
+  }
+
+  function extractProfileSnapshot(payload, pageUserHandle, pageUserKey){
+    try {
+      if (!payload || typeof payload !== 'object') return null;
+      const looksLikeProfile = (obj) => {
+        if (!obj || typeof obj !== 'object') return false;
+        if (obj.user_id != null || obj.id != null) return true;
+        if (typeof obj.username === 'string' || typeof obj.handle === 'string') return true;
+        if (obj.cameo_count != null || obj.follower_count != null) return true;
+        return false;
+      };
+      const findProfile = (root) => {
+        if (looksLikeProfile(root)) return root;
+        const direct = root.profile || root.data?.profile || root.owner_profile || null;
+        if (looksLikeProfile(direct)) return direct;
+        const arr = root.items || root.data?.items || [];
+        for (const it of Array.isArray(arr) ? arr : []) {
+          if (looksLikeProfile(it?.profile)) return it.profile;
+          if (looksLikeProfile(it?.owner_profile)) return it.owner_profile;
+          const p = it?.post || it || {};
+          if (looksLikeProfile(p?.owner_profile)) return p.owner_profile;
+          if (looksLikeProfile(p?.author)) return p.author;
+        }
+        return null;
+      };
+      const prof = findProfile(payload);
+      const profFollowers = Number(payload?.follower_count ?? payload?.profile?.follower_count ?? prof?.follower_count);
+      const profCameos = Number(payload?.cameo_count ?? payload?.profile?.cameo_count ?? prof?.cameo_count);
+      const profHandle =
+        (payload?.username || payload?.handle || payload?.profile?.username || prof?.username || pageUserHandle || '')
+          .toString() || null;
+      const profId = payload?.user_id || payload?.id || payload?.profile?.user_id || prof?.user_id || null;
+      const userKey = profHandle ? `h:${String(profHandle).toLowerCase()}` : (profId != null ? `id:${profId}` : null);
+      if (!userKey) return null;
+      return {
+        userKey,
+        userHandle: profHandle || null,
+        userId: profId != null ? String(profId) : null,
+        followers: Number.isFinite(profFollowers) ? profFollowers : null,
+        cameos: Number.isFinite(profCameos) ? profCameos : null,
+        pageUserHandle,
+        pageUserKey
+      };
+    } catch {}
+    return null;
+  }
+
+  function queueProfileSnapshot(batch, payload, pageUserHandle, pageUserKey){
+    const snap = extractProfileSnapshot(payload, pageUserHandle, pageUserKey);
+    if (!snap) return;
+    const base = {
+      ts: Date.now(),
+      userHandle: snap.userHandle,
+      userId: snap.userId,
+      userKey: snap.userKey,
+      pageUserHandle,
+      pageUserKey
+    };
+    if (snap.followers != null) batch.push({ ...base, followers: snap.followers });
+    if (snap.cameos != null) batch.push({ ...base, cameo_count: snap.cameos });
+  }
+
+  function processProfileJson(json){
+    const pageHandle = isProfile() ? currentProfileHandleFromURL() : null;
+    const pageUserHandle = pageHandle || null;
+    const pageUserKey = pageUserHandle ? `h:${pageUserHandle.toLowerCase()}` : 'unknown';
+    const batch = [];
+    queueProfileSnapshot(batch, json, pageUserHandle, pageUserKey);
+    if (batch.length) {
+      try {
+        window.postMessage({ __sora_uv__: true, type: 'metrics_batch', items: batch }, '*');
+      } catch {}
+    }
   }
 
   function processFeedJson(json) {
@@ -5076,34 +5218,7 @@ async function renderAnalyzeTable(force = false) {
     dlog('feed', 'processFeedJson', { items: items.length, pageUserHandle });
 
     try {
-      const findProfile = (root) => {
-        if (!root || typeof root !== 'object') return null;
-        const direct = root.profile || root.data?.profile || root.owner_profile || null;
-        if (direct) return direct;
-        const arr = root.items || root.data?.items || [];
-        for (const it of Array.isArray(arr) ? arr : []) {
-          if (it?.profile) return it.profile;
-          if (it?.owner_profile) return it.owner_profile;
-          const p = it?.post || it || {};
-          if (p?.owner_profile) return p.owner_profile;
-          if (p?.author && (p.author.cameo_count != null || p.author.follower_count != null || p.author.username))
-            return p.author;
-        }
-        return null;
-      };
-      const prof = findProfile(json);
-      const profFollowers = Number(json?.follower_count ?? json?.profile?.follower_count ?? prof?.follower_count);
-      const profCameos = Number(json?.cameo_count ?? json?.profile?.cameo_count ?? prof?.cameo_count);
-      const profHandle =
-        (json?.username || json?.handle || json?.profile?.username || prof?.username || pageUserHandle || '')
-          .toString() || null;
-      const profId = json?.user_id || json?.id || json?.profile?.user_id || prof?.user_id || null;
-      if (profHandle) {
-        const userKey = `h:${String(profHandle).toLowerCase()}`;
-        const base = { ts: Date.now(), userHandle: profHandle, userId: profId, userKey, pageUserHandle, pageUserKey };
-        if (Number.isFinite(profFollowers)) batch.push({ ...base, followers: profFollowers });
-        if (Number.isFinite(profCameos)) batch.push({ ...base, cameo_count: profCameos });
-      }
+      queueProfileSnapshot(batch, json, pageUserHandle, pageUserKey);
     } catch {}
 
     for (const it of items) {
@@ -5708,6 +5823,7 @@ async function renderAnalyzeTable(force = false) {
     if (!Array.isArray(items) || items.length === 0) return;
 
     dlog('characters', `Processing ${items.length} characters`);
+    const batch = [];
 
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
@@ -5715,6 +5831,7 @@ async function renderAnalyzeTable(force = false) {
         const userId = item?.user_id;
         const username = item?.username;
         if (!userId) continue;
+        const isCharacter = typeof userId === 'string' && userId.startsWith('ch_');
 
         // Store username -> userId mapping
         if (username) {
@@ -5729,6 +5846,16 @@ async function renderAnalyzeTable(force = false) {
         // Extract character stats
         if (typeof item.cameo_count === 'number') {
           charToCameoCount.set(userId, item.cameo_count);
+          if (isCharacter) {
+            const userKey = username ? `h:${username.toLowerCase()}` : `id:${userId}`;
+            batch.push({
+              ts: Date.now(),
+              userKey,
+              userHandle: username || null,
+              userId,
+              cameo_count: item.cameo_count
+            });
+          }
         }
         if (typeof item.likes_received_count === 'number') {
           charToLikesCount.set(userId, item.likes_received_count);
@@ -5746,6 +5873,12 @@ async function renderAnalyzeTable(force = false) {
       } catch (e) {
         console.error('[SoraUV] Error processing character item:', e);
       }
+    }
+
+    if (batch.length) {
+      try {
+        window.postMessage({ __sora_uv__: true, type: 'metrics_batch', items: batch }, '*');
+      } catch {}
     }
 
     // Trigger render to show character stats (this will also handle re-sorting)
@@ -6580,10 +6713,7 @@ async function renderAnalyzeTable(force = false) {
         if (dashboardInjectRetryId) clearTimeout(dashboardInjectRetryId);
       } catch {}
       dashboardInjectRetryId = null;
-      try {
-        if (dashboardBtnEl && document.contains(dashboardBtnEl)) dashboardBtnEl.remove();
-      } catch {}
-      dashboardBtnEl = null;
+      scheduleInjectDashboardButton();
       return;
     } else if (!observersActive) {
       // If we previously disabled for /d/... and navigated back, resume observers.
@@ -6880,7 +7010,8 @@ async function renderAnalyzeTable(force = false) {
     dlog('feed', 'init');
     ensureToastStyles();
     if (isDraftDetail()) {
-      dlog('feed', 'draft detail route detected; not initializing');
+      dlog('feed', 'draft detail route detected; injecting dashboard only');
+      scheduleInjectDashboardButton();
       return;
     }
     // Allow auto-starting Gather on Top feed or Profile via URL param.

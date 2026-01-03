@@ -9,6 +9,8 @@
   const TOP_TODAY_WINDOW_MS = 24 * 60 * 60 * 1000;
   const TOP_TODAY_MIN_UNIQUE_VIEWS = 100;
     const TOP_TODAY_MIN_LIKES = 15;
+  const AUTO_REFRESH_MS = 60000;
+  const CAMEO_KEY_PREFIX = 'c:';
   const ULTRA_MODE_STORAGE_KEY = 'SCT_ULTRA_MODE_V1';
   const ULTRA_MODE_TAP_COUNT = 5;
     const SITE_ORIGIN = 'https://sora.chatgpt.com';
@@ -117,12 +119,22 @@
   const BOOT_CACHE_MAX_BYTES = 350 * 1024;
   const BEST_TIME_CACHE_KEY = 'SCT_DASHBOARD_BEST_TIME_V2';
   const BEST_TIME_PREFS_KEY = 'SCT_DASHBOARD_BEST_TIME_PREFS_V1';
+  const VIEWS_TYPE_STORAGE_KEY = 'SCT_DASHBOARD_VIEWS_TYPE_V1';
   let metrics = { users: {} };
   let lastMetricsUpdatedAt = 0;
   let usersIndex = null;
   let isMetricsPartial = false;
   let lastSessionCacheAt = 0;
   let currentUserKey = null;
+  let lastSelectedUserKey = null;
+  let nextAutoRefreshAt = 0;
+  let autoRefreshCountdownTimer = null;
+  let cameoSuggestionCache = { updatedAt: -1, userCount: -1, list: [] };
+  let cameoUserCache = { updatedAt: -1, users: new Map() };
+  let postHydrationToken = 0;
+  let isHydratingPosts = false;
+  let metricsHydrationToken = 0;
+  let isHydratingMetrics = false;
   const ESC_MAP = { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' };
   const esc = (s)=> String(s).replace(/[&<>"']/g, (c)=> ESC_MAP[c] || c);
   const PERF_STORAGE_KEY = 'SCT_DASHBOARD_PERF';
@@ -130,6 +142,13 @@
   const PERF_ENABLED = (function(){
     try { return localStorage.getItem(PERF_STORAGE_KEY) === '1'; } catch { return false; }
   })();
+  const CACHE_DEBUG_ENABLED = (function(){
+    try { return localStorage.getItem('SCT_DASHBOARD_CACHE_DEBUG') === '1'; } catch { return false; }
+  })();
+  const cacheLog = (...args)=>{
+    if (!CACHE_DEBUG_ENABLED) return;
+    try { console.log('[Dashboard][Cache]', ...args); } catch {}
+  };
   const PERF_AUTO_ENABLED = (function(){
     try { return localStorage.getItem(PERF_STORAGE_AUTO_KEY) === '1'; } catch { return false; }
   })();
@@ -194,7 +213,6 @@
   function normalizeDashboardCache(cache){
     if (!cache || typeof cache !== 'object') return null;
     if (!cache.userKey || !cache.user || !cache.usersIndex) return null;
-    if (cache.userKey === TOP_TODAY_KEY) return null;
     const index = normalizeUsersIndex(cache.usersIndex);
     if (!index || !index.length) return null;
     const bestTimeData = normalizeBestTimeData(cache?.bestTime?.data);
@@ -238,35 +256,124 @@
     return loadSessionCache() || loadBootCache();
   }
 
+  function trackLastSelectedUserKey(){
+    if (!currentUserKey || isTopTodayKey(currentUserKey)) return;
+    lastSelectedUserKey = currentUserKey;
+  }
+
+  function resolveCacheUserKeyForSave(){
+    if (currentUserKey) return currentUserKey;
+    if (lastSelectedUserKey && !isTopTodayKey(lastSelectedUserKey)) return lastSelectedUserKey;
+    return null;
+  }
+
+  function buildBootUsersIndex(cache, user){
+    const key = cache?.userKey;
+    if (!key) return [];
+    const fallbackUser = user || cache?.user || {};
+    const existing = Array.isArray(cache?.usersIndex)
+      ? cache.usersIndex.find((entry)=> entry && entry.key === key)
+      : null;
+    const handle = existing?.handle || fallbackUser.handle || (key.startsWith('h:') ? key.slice(2) : null);
+    const id = existing?.id ?? fallbackUser.id ?? (key.startsWith('id:') ? key.slice(3) : null);
+    const postCount = Number(existing?.postCount);
+    const count = Number.isFinite(postCount) ? postCount : Object.keys(fallbackUser.posts || {}).length;
+    return [{
+      key,
+      handle: handle || null,
+      id: id != null ? String(id) : null,
+      postCount: count
+    }];
+  }
+
   function buildBootCache(cache){
     if (!cache || typeof cache !== 'object') return null;
     const user = cache.user;
     if (!user || typeof user !== 'object') return null;
+    const slimPostForBoot = (post)=>{
+      if (!post || typeof post !== 'object') return null;
+      const out = {};
+      if (typeof post.url === 'string') out.url = post.url;
+      if (typeof post.thumb === 'string') out.thumb = post.thumb;
+      if (typeof post.caption === 'string') {
+        out.caption = post.caption.length > 320 ? post.caption.slice(0, 320) : post.caption;
+      }
+      if (Array.isArray(post.cameos)) out.cameos = post.cameos.slice(0, 12);
+      if (post.post_time != null) out.post_time = post.post_time;
+      if (post.ownerKey) out.ownerKey = post.ownerKey;
+      if (post.ownerHandle) out.ownerHandle = post.ownerHandle;
+      if (post.ownerId) out.ownerId = post.ownerId;
+      if (post.lastSeen) out.lastSeen = post.lastSeen;
+      if (post.parentPostId) out.parentPostId = post.parentPostId;
+      if (post.rootPostId) out.rootPostId = post.rootPostId;
+      return out;
+    };
     const posts = {};
     for (const [pid, post] of Object.entries(user.posts || {})){
       if (!post || typeof post !== 'object') continue;
+      const slim = slimPostForBoot(post);
+      if (!slim) continue;
       const last = latestSnapshot(post.snapshots);
-      const next = { ...post };
+      const next = { ...slim };
       if (last) next.snapshots = [last];
       else if (Array.isArray(next.snapshots)) next.snapshots = [];
       posts[pid] = next;
     }
-    const liteUser = { ...user, posts };
+    const liteUser = { posts };
+    if (typeof user.handle === 'string') liteUser.handle = user.handle;
+    if (user.id != null) liteUser.id = user.id;
     if (Array.isArray(user.followers)) liteUser.followers = user.followers.slice(-1);
     if (Array.isArray(user.cameos)) liteUser.cameos = user.cameos.slice(-1);
-    return { ...cache, user: liteUser };
+    if (user.__specialKey) liteUser.__specialKey = user.__specialKey;
+    const bootUsersIndex = buildBootUsersIndex(cache, liteUser);
+    if (!bootUsersIndex.length) return null;
+    return { ...cache, user: liteUser, usersIndex: bootUsersIndex };
   }
 
-  function shrinkBootCacheToFit(cache, maxBytes){
-    if (!cache || !cache.user || !cache.user.posts) return null;
+  function safeStringifyCache(value){
+    try { return JSON.stringify(value); } catch {}
     try {
-      const initialJson = JSON.stringify(cache);
-      if (initialJson.length <= maxBytes) return cache;
+      return JSON.stringify(value, (_key, v)=>{
+        if (typeof v === 'bigint') return v.toString();
+        if (typeof v === 'function') return undefined;
+        return v;
+      });
     } catch {
       return null;
     }
+  }
+
+  function trimUsersIndexForBoot(cache){
+    const list = Array.isArray(cache?.usersIndex) ? cache.usersIndex : null;
+    if (!list || list.length <= 1) return;
+    const key = cache.userKey;
+    let entry = key ? list.find((it)=> it && it.key === key) : null;
+    if (!entry) entry = list[0] || null;
+    if (!entry) return;
+    cache.usersIndex = [entry];
+  }
+
+  function shrinkBootCacheToFit(cache, maxBytes){
+    if (!cache || !cache.user) return null;
+    if (!cache.user.posts || typeof cache.user.posts !== 'object') cache.user.posts = {};
+    const initialJson = safeStringifyCache(cache);
+    if (!initialJson) {
+      cacheLog('boot cache stringify failed');
+      return null;
+    }
+    if (initialJson.length <= maxBytes) return cache;
+    cacheLog('boot cache oversized', { bytes: initialJson.length, maxBytes });
+    if (Array.isArray(cache.usersIndex) && cache.usersIndex.length > 1) {
+      const before = cache.usersIndex.length;
+      trimUsersIndexForBoot(cache);
+      const indexJson = safeStringifyCache(cache);
+      if (indexJson && indexJson.length <= maxBytes) {
+        cacheLog('boot cache trimmed usersIndex', { before, after: cache.usersIndex.length });
+        return cache;
+      }
+    }
     const entries = Object.entries(cache.user.posts || {});
-    if (!entries.length) return null;
+    if (!entries.length) return cache;
     entries.sort((a, b) => {
       const at = latestSnapshot(a[1]?.snapshots)?.t || 0;
       const bt = latestSnapshot(b[1]?.snapshots)?.t || 0;
@@ -276,25 +383,38 @@
     const trimmedCache = { ...cache, user: trimmedUser };
     for (const [pid, post] of entries) {
       trimmedUser.posts[pid] = post;
-      try {
-        const json = JSON.stringify(trimmedCache);
-        if (json.length > maxBytes) {
-          delete trimmedUser.posts[pid];
-          break;
-        }
-      } catch {
+      const json = safeStringifyCache(trimmedCache);
+      if (!json) {
+        delete trimmedUser.posts[pid];
+        break;
+      }
+      if (json.length > maxBytes) {
         delete trimmedUser.posts[pid];
         break;
       }
     }
-    return Object.keys(trimmedUser.posts).length ? trimmedCache : null;
+    const kept = Object.keys(trimmedUser.posts).length;
+    if (!kept) {
+      cacheLog('boot cache trimmed to empty posts');
+      trimmedUser.posts = {};
+      return trimmedCache;
+    }
+    return trimmedCache;
   }
 
-  function saveSessionCache(){
+  function saveSessionCache(opts = {}){
     try {
-      if (!currentUserKey || isTopTodayKey(currentUserKey)) return;
-      const user = metrics?.users?.[currentUserKey];
-      if (!user) return;
+      const force = !!opts.force;
+      const cacheUserKey = resolveCacheUserKeyForSave();
+      if (!cacheUserKey) {
+        cacheLog('skip: no cache user', { currentUserKey, lastSelectedUserKey });
+        return;
+      }
+      const user = resolveUserForKey(metrics, cacheUserKey);
+      if (!user) {
+        cacheLog('skip: user missing', { cacheUserKey });
+        return;
+      }
       if (!Array.isArray(usersIndex) || !usersIndex.length) {
         usersIndex = buildUsersIndexFromMetrics(metrics);
       }
@@ -305,7 +425,7 @@
         savedAt: lastBestTimeUpdate || 0
       } : null;
       const cache = {
-        userKey: currentUserKey,
+        userKey: cacheUserKey,
         user,
         usersIndex,
         metricsUpdatedAt: lastMetricsUpdatedAt || 0,
@@ -313,19 +433,40 @@
         bestTime
       };
       const json = JSON.stringify(cache);
-      if (json.length > SESSION_CACHE_MAX_BYTES) return;
       const now = Date.now();
-      if (now - lastSessionCacheAt < 5000) return;
+      if (!force && now - lastSessionCacheAt < 5000) {
+        cacheLog('skip: throttle', { deltaMs: now - lastSessionCacheAt });
+        return;
+      }
       lastSessionCacheAt = now;
-      try { sessionStorage.setItem(SESSION_CACHE_KEY, json); } catch {}
+      if (json.length <= SESSION_CACHE_MAX_BYTES) {
+        try { sessionStorage.setItem(SESSION_CACHE_KEY, json); } catch {}
+      } else {
+        cacheLog('session cache too large', { bytes: json.length });
+      }
       try {
         const bootCache = buildBootCache(cache);
+        if (!bootCache) {
+          cacheLog('boot cache build failed');
+        }
         const trimmedBootCache = bootCache ? shrinkBootCacheToFit(bootCache, BOOT_CACHE_MAX_BYTES) : null;
         if (!trimmedBootCache) {
+          cacheLog('boot cache trimmed to null');
           localStorage.removeItem(BOOT_CACHE_KEY);
           return;
         }
-        localStorage.setItem(BOOT_CACHE_KEY, JSON.stringify(trimmedBootCache));
+        const bootJson = safeStringifyCache(trimmedBootCache);
+        if (!bootJson) {
+          cacheLog('boot cache stringify failed at save');
+          localStorage.removeItem(BOOT_CACHE_KEY);
+          return;
+        }
+        localStorage.setItem(BOOT_CACHE_KEY, bootJson);
+        cacheLog('boot cache saved', {
+          bytes: bootJson.length,
+          userKey: trimmedBootCache.userKey,
+          postCount: Object.keys(trimmedBootCache?.user?.posts || {}).length
+        });
       } catch {}
     } catch {}
   }
@@ -421,28 +562,47 @@
     } catch {}
   }
 
+  function normalizeBestTimePrefs(raw){
+    if (!raw || typeof raw !== 'object') return null;
+    const out = {};
+    if (['week', 'month', 'year'].includes(raw?.range)) out.range = raw.range;
+    if (['primary', 'secondary', 'today'].includes(raw?.rec)) out.rec = raw.rec;
+    return Object.keys(out).length ? out : null;
+  }
+
   function loadBestTimePrefs(){
     try {
       const raw = localStorage.getItem(BEST_TIME_PREFS_KEY);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      const out = {};
-      if (['week', 'month', 'year'].includes(parsed?.range)) out.range = parsed.range;
-      if (['primary', 'secondary', 'today'].includes(parsed?.rec)) out.rec = parsed.rec;
-      return Object.keys(out).length ? out : null;
-    } catch {
-      return null;
-    }
+      if (raw) return normalizeBestTimePrefs(JSON.parse(raw));
+    } catch {}
+    return normalizeBestTimePrefs(bestTimePrefsFromStorage);
   }
 
   function saveBestTimePrefs(){
-    try {
-      localStorage.setItem(BEST_TIME_PREFS_KEY, JSON.stringify({
-        range: bestTimeRange,
-        rec: bestTimeRec,
-        savedAt: Date.now()
-      }));
-    } catch {}
+    const payload = {
+      range: bestTimeRange,
+      rec: bestTimeRec,
+      savedAt: Date.now()
+    };
+    try { localStorage.setItem(BEST_TIME_PREFS_KEY, JSON.stringify(payload)); } catch {}
+    try { chrome.storage.local.set({ [BEST_TIME_PREFS_KEY]: payload }); } catch {}
+    bestTimePrefsLoaded = true;
+    bestTimePrefsFromStorage = normalizeBestTimePrefs(payload);
+  }
+
+  function normalizeViewsChartType(raw){
+    return raw === 'unique' || raw === 'total' ? raw : null;
+  }
+
+  function loadViewsChartType(){
+    try { return normalizeViewsChartType(localStorage.getItem(VIEWS_TYPE_STORAGE_KEY)); } catch { return null; }
+  }
+
+  function saveViewsChartType(type){
+    const normalized = normalizeViewsChartType(type);
+    if (!normalized) return;
+    try { localStorage.setItem(VIEWS_TYPE_STORAGE_KEY, normalized); } catch {}
+    try { chrome.storage.local.set({ [VIEWS_TYPE_STORAGE_KEY]: normalized }); } catch {}
   }
 
   let lastBestTimeUpdate = 0;
@@ -450,6 +610,8 @@
   let bestTimeData = null;
   let bestTimeRange = 'year';
   let bestTimeRec = 'primary';
+  let bestTimePrefsFromStorage = null;
+  let bestTimePrefsLoaded = false;
   let bestTimeHeatmapTooltip = null;
   let bestTimeInfoTooltip = null;
   let bestTimeRefreshInFlight = false;
@@ -458,6 +620,7 @@
   function hydrateBestTimeFromCache(sessionCache){
     try {
       const prefs = loadBestTimePrefs();
+      bestTimePrefsLoaded = !!prefs;
       if (prefs?.range) bestTimeRange = prefs.range;
       if (prefs?.rec) bestTimeRec = prefs.rec;
       const cachedBestTime = sessionCache?.bestTime?.data ? sessionCache.bestTime : loadBestTimeCache();
@@ -935,6 +1098,33 @@
     }
     return best < Infinity ? best : 0;
   }
+  function normalizeCameoName(name){
+    if (!name) return '';
+    return String(name).trim().toLowerCase();
+  }
+  function isCharacterId(id){
+    return typeof id === 'string' && id.startsWith('ch_');
+  }
+  function isCameoKey(k){
+    return typeof k === 'string' && k.startsWith(CAMEO_KEY_PREFIX);
+  }
+  function cameoNameFromKey(k){
+    return isCameoKey(k) ? k.slice(CAMEO_KEY_PREFIX.length) : '';
+  }
+  function makeCameoKey(name){
+    const normalized = normalizeCameoName(name);
+    return normalized ? `${CAMEO_KEY_PREFIX}${normalized}` : null;
+  }
+  function formatCameoLabel(name){
+    return name;
+  }
+  function isVirtualUserKey(k){
+    return isTopTodayKey(k) || isCameoKey(k);
+  }
+  function isVirtualUser(user){
+    const key = user?.__specialKey || '';
+    return key === TOP_TODAY_KEY || isCameoKey(key);
+  }
   function isTopTodayKey(k){ return k === TOP_TODAY_KEY; }
   function buildTopTodayUser(metrics){
     const now = Date.now();
@@ -966,9 +1156,109 @@
     }
     return { handle: 'Top Today', id: null, posts, followers: [], cameos: [], __specialKey: TOP_TODAY_KEY };
   }
+  function findUserByHandle(metrics, handle){
+    if (!handle || !metrics?.users) return null;
+    const normalized = normalizeCameoName(handle);
+    if (!normalized) return null;
+    const directKey = `h:${normalized}`;
+    const directUser = metrics.users[directKey];
+    if (directUser) return directUser;
+    let best = null;
+    for (const user of Object.values(metrics.users || {})){
+      const userHandle = normalizeCameoName(user?.handle || user?.userHandle || '');
+      if (!userHandle || userHandle !== normalized) continue;
+      if (!best) {
+        best = user;
+        continue;
+      }
+      if (isCharacterId(user?.id) && !isCharacterId(best?.id)) {
+        best = user;
+        continue;
+      }
+      const bestCount = Array.isArray(best?.cameos) ? best.cameos.length : 0;
+      const userCount = Array.isArray(user?.cameos) ? user.cameos.length : 0;
+      if (userCount > bestCount) best = user;
+    }
+    return best;
+  }
+  function findUserById(metrics, id){
+    if (!id || !metrics?.users) return null;
+    const needle = String(id);
+    const directKey = `id:${needle}`;
+    const directUser = metrics.users[directKey];
+    if (directUser) return directUser;
+    for (const user of Object.values(metrics.users || {})){
+      if (user?.id != null && String(user.id) === needle) return user;
+    }
+    return null;
+  }
+  function buildCameoUser(metrics, cameoName){
+    const name = normalizeCameoName(cameoName);
+    if (!name) return null;
+    const key = makeCameoKey(name);
+    const updatedAt = Number(lastMetricsUpdatedAt) || 0;
+    if (cameoUserCache.updatedAt !== updatedAt) {
+      cameoUserCache.updatedAt = updatedAt;
+      cameoUserCache.users.clear();
+    }
+    if (key && cameoUserCache.users.has(key)) return cameoUserCache.users.get(key);
+    const posts = {};
+    for (const [userKey, user] of Object.entries(metrics?.users || {})){
+      const userHandle = user?.handle || user?.userHandle || (userKey.startsWith('h:') ? userKey.slice(2) : null);
+      for (const [pid, p] of Object.entries(user?.posts || {})){
+        const ownerHandle = p?.ownerHandle || p?.userHandle || userHandle || null;
+        const ownerMatch = normalizeCameoName(ownerHandle) === name;
+        let cameoMatch = false;
+        if (!ownerMatch) {
+          const cameos = Array.isArray(p?.cameo_usernames) ? p.cameo_usernames : [];
+          for (const cameo of cameos){
+            if (normalizeCameoName(cameo) === name) { cameoMatch = true; break; }
+          }
+        }
+        if (!ownerMatch && !cameoMatch) continue;
+        const existing = posts[pid];
+        if (existing){
+          const a = Array.isArray(existing.snapshots) ? existing.snapshots.length : 0;
+          const b = Array.isArray(p.snapshots) ? p.snapshots.length : 0;
+          if (b <= a) continue;
+        }
+        const next = ownerHandle && !p?.ownerHandle ? { ...p, ownerHandle } : p;
+        posts[pid] = next;
+      }
+    }
+    const profileUser = findUserByHandle(metrics, name);
+    const cameoHistory = Array.isArray(profileUser?.cameos) ? profileUser.cameos.slice() : [];
+    const cameoUser = {
+      handle: profileUser?.handle || name,
+      id: profileUser?.id || null,
+      posts,
+      followers: [],
+      cameos: cameoHistory,
+      __specialKey: key
+    };
+    if (key) cameoUserCache.users.set(key, cameoUser);
+    return cameoUser;
+  }
   function resolveUserForKey(metrics, userKey){
-    if (isTopTodayKey(userKey)) return buildTopTodayUser(metrics);
-    return metrics?.users?.[userKey] || null;
+    if (isTopTodayKey(userKey)) {
+      const cachedTopToday = metrics?.users?.[TOP_TODAY_KEY];
+      if (cachedTopToday) return cachedTopToday;
+      return buildTopTodayUser(metrics);
+    }
+    if (isCameoKey(userKey)) {
+      const cachedCameo = metrics?.users?.[userKey];
+      if (cachedCameo) return cachedCameo;
+      return buildCameoUser(metrics, cameoNameFromKey(userKey));
+    }
+    const direct = metrics?.users?.[userKey] || null;
+    if (direct) return direct;
+    if (typeof userKey === 'string' && userKey.startsWith('h:')) {
+      return findUserByHandle(metrics, userKey.slice(2));
+    }
+    if (typeof userKey === 'string' && userKey.startsWith('id:')) {
+      return findUserById(metrics, userKey.slice(3));
+    }
+    return null;
   }
   const DBG_SORT = false; // hide noisy sorting logs by default
 
@@ -1128,7 +1418,11 @@
     const users = metrics?.users || {};
     for (const [key, user] of Object.entries(users)){
       const posts = user?.posts || {};
-      if (!posts || Object.keys(posts).length === 0){
+      const hasPosts = posts && Object.keys(posts).length > 0;
+      const hasFollowers = Array.isArray(user?.followers) && user.followers.length > 0;
+      const hasCameos = Array.isArray(user?.cameos) && user.cameos.length > 0;
+      const keepForCharacter = isCharacterId(user?.id);
+      if (!hasPosts && !hasFollowers && !hasCameos && !keepForCharacter){
         delete users[key];
         removed++;
       }
@@ -1187,8 +1481,6 @@
     return metrics;
   }
 
-
-
   function buildUserOptions(metrics){
     const sel = $('#userSelect');
     sel.innerHTML = '';
@@ -1228,31 +1520,75 @@
     return users.length ? users[0][0] : null;
   }
 
+  function updateAutoRefreshCountdown(userKey = currentUserKey){
+    const el = $('#metricsAutoRefresh');
+    if (!el) return;
+    const show = !!userKey;
+    if (!show) {
+      el.textContent = '';
+      el.classList.add('is-hidden');
+      return;
+    }
+    el.classList.remove('is-hidden');
+    if (!nextAutoRefreshAt) nextAutoRefreshAt = Date.now() + AUTO_REFRESH_MS;
+    const remainingMs = Math.max(0, nextAutoRefreshAt - Date.now());
+    const remainingSec = Math.max(0, Math.ceil(remainingMs / 1000));
+    el.textContent = `refreshing in ${remainingSec}`;
+  }
+
+  function resetAutoRefreshCountdown(){
+    nextAutoRefreshAt = Date.now() + AUTO_REFRESH_MS;
+    updateAutoRefreshCountdown(currentUserKey);
+  }
+
+  function startAutoRefreshCountdown(){
+    if (autoRefreshCountdownTimer) return;
+    resetAutoRefreshCountdown();
+    autoRefreshCountdownTimer = setInterval(() => {
+      updateAutoRefreshCountdown(currentUserKey);
+    }, 1000);
+  }
+
   function updateMetricsHeader(userKey, user){
     const header = $('#metricsHeader');
-    if (!header) return;
+    const headerText = $('#metricsHeaderText') || header;
+    if (!headerText) return;
     if (!userKey) {
-      header.textContent = 'Metrics for —';
+      headerText.textContent = 'Metrics for —';
+      updateAutoRefreshCountdown(userKey);
       return;
     }
     if (isTopTodayKey(userKey)) {
-      header.textContent = 'Metrics for Everyone Today';
+      headerText.textContent = 'Metrics for Everyone Today';
+      updateAutoRefreshCountdown(userKey);
+      return;
+    }
+    if (isCameoKey(userKey)) {
+      const cameoName = cameoNameFromKey(userKey) || user?.handle || 'Unknown';
+      headerText.textContent = `Metrics for ${formatCameoLabel(cameoName)}`;
+      updateAutoRefreshCountdown(userKey);
       return;
     }
     const raw = user?.handle || (userKey || '').replace(/^h:/i, '');
     const name = raw || 'Unknown';
-    header.textContent = `Metrics for ${name}`;
+    headerText.textContent = `Metrics for ${name}`;
+    updateAutoRefreshCountdown(userKey);
   }
 
   function getGatherDisplayName(userKey, user){
     if (!userKey) return '—';
     if (isTopTodayKey(userKey)) return EVERYONE_LABEL;
+    if (isCameoKey(userKey)) return cameoNameFromKey(userKey) || user?.handle || 'Unknown';
     const raw = user?.handle || (userKey || '').replace(/^h:/i, '');
     return raw || 'Unknown';
   }
 
   function getProfileHandleFromKey(userKey, user){
     if (!userKey || isTopTodayKey(userKey)) return '';
+    if (isCameoKey(userKey)) {
+      const cameoName = cameoNameFromKey(userKey) || user?.handle || '';
+      return cameoName.replace(/^@/, '').trim();
+    }
     const raw = user?.handle || (userKey || '').replace(/^h:/i, '');
     if (!raw) return '';
     return raw.replace(/^@/, '').trim();
@@ -1263,7 +1599,11 @@
     const link = $('#metricsGatherLink');
     if (!noteText || !link) return;
     const label = getGatherDisplayName(userKey, user);
-    noteText.textContent = `Based on all post you've seen from ${label}.`;
+    if (isCameoKey(userKey)) {
+      noteText.textContent = `Based on all posts you've seen tied to ${label}.`;
+    } else {
+      noteText.textContent = `Based on all posts you've seen from ${label}.`;
+    }
     let url = '';
     if (userKey) {
       if (isTopTodayKey(userKey)) {
@@ -1279,6 +1619,55 @@
     } else {
       link.setAttribute('aria-disabled', 'true');
     }
+  }
+
+  function collectCameoUsernamesFromMetrics(metrics){
+    const userPostIds = new Map();
+    for (const [userKey, user] of Object.entries(metrics?.users || {})){
+      const userHandle = user?.handle || user?.userHandle || (userKey.startsWith('h:') ? userKey.slice(2) : null);
+      for (const [pid, p] of Object.entries(user?.posts || {})){
+        const tiedUsernames = new Set();
+        const ownerHandle = p?.ownerHandle || p?.userHandle || userHandle || null;
+        const ownerName = normalizeCameoName(ownerHandle);
+        if (ownerName) tiedUsernames.add(ownerName);
+        const cameos = Array.isArray(p?.cameo_usernames) ? p.cameo_usernames : [];
+        for (const cameo of cameos){
+          const cameoName = normalizeCameoName(cameo);
+          if (cameoName) tiedUsernames.add(cameoName);
+        }
+        for (const username of tiedUsernames){
+          let postIds = userPostIds.get(username);
+          if (!postIds) {
+            postIds = new Set();
+            userPostIds.set(username, postIds);
+          }
+          postIds.add(pid);
+        }
+      }
+    }
+    return Array.from(userPostIds.entries())
+      .map(([username, postIds]) => ({ username, count: postIds.size }))
+      .sort((a, b) => (b.count - a.count) || a.username.localeCompare(b.username));
+  }
+
+  function getCameoSuggestionItems(metrics, query){
+    const updatedAt = Number(lastMetricsUpdatedAt) || 0;
+    const userCount = Object.keys(metrics?.users || {}).length;
+    if (cameoSuggestionCache.updatedAt !== updatedAt || cameoSuggestionCache.userCount !== userCount) {
+      cameoSuggestionCache.updatedAt = updatedAt;
+      cameoSuggestionCache.userCount = userCount;
+      cameoSuggestionCache.list = collectCameoUsernamesFromMetrics(metrics);
+    }
+    const needle = (query || '').trim().toLowerCase();
+    const list = cameoSuggestionCache.list || [];
+    const filtered = needle ? list.filter((item)=> item.username.includes(needle)) : list;
+    const out = [];
+    for (const item of filtered){
+      const key = makeCameoKey(item.username);
+      if (!key) continue;
+      out.push({ key, label: formatCameoLabel(item.username), count: item.count });
+    }
+    return out;
   }
 
   function filterUsersByQuery(metrics, q){
@@ -1318,6 +1707,129 @@
     return Object.keys(user?.posts || {}).length;
   }
 
+  function getPostsHydrateIndicator(){
+    const wrap = $('#posts');
+    if (!wrap) return null;
+    let el = wrap.querySelector('.posts-hydrate');
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'posts-hydrate';
+      el.setAttribute('role', 'status');
+      el.setAttribute('aria-hidden', 'true');
+      el.setAttribute('aria-live', 'polite');
+      el.setAttribute('aria-atomic', 'true');
+      const spinner = document.createElement('div');
+      spinner.className = 'posts-hydrate-spinner';
+      for (let i = 0; i < 8; i++) {
+        const dot = document.createElement('span');
+        dot.style.setProperty('--i', i);
+        spinner.appendChild(dot);
+      }
+      el.appendChild(spinner);
+      wrap.appendChild(el);
+    }
+    return el;
+  }
+
+  function getUserSelectHydrateIndicator(){
+    const wrap = document.querySelector('.user-select-bar .user-picker');
+    if (!wrap) return null;
+    let el = wrap.querySelector('.user-select-hydrate');
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'user-select-hydrate';
+      el.setAttribute('role', 'status');
+      el.setAttribute('aria-hidden', 'true');
+      el.setAttribute('aria-live', 'polite');
+      el.setAttribute('aria-atomic', 'true');
+      const spinner = document.createElement('div');
+      spinner.className = 'user-select-spinner';
+      for (let i = 0; i < 8; i++) {
+        const dot = document.createElement('span');
+        dot.style.setProperty('--i', i);
+        spinner.appendChild(dot);
+      }
+      el.appendChild(spinner);
+      wrap.appendChild(el);
+      wrap.classList.add('has-hydrate-indicator');
+    }
+    return el;
+  }
+
+  function getUserSelectMeasureSpan(){
+    const wrap = document.querySelector('.user-select-bar .user-picker');
+    if (!wrap) return null;
+    let el = wrap.querySelector('.user-select-measure');
+    if (!el) {
+      el = document.createElement('span');
+      el.className = 'user-select-measure';
+      el.setAttribute('aria-hidden', 'true');
+      wrap.appendChild(el);
+    }
+    return el;
+  }
+
+  function updateUserSelectHydrateIndicatorPosition(){
+    const wrap = document.querySelector('.user-select-bar .user-picker');
+    if (!wrap) return;
+    const input = wrap.querySelector('input[type=search]');
+    const spinnerWrap = wrap.querySelector('.user-select-hydrate');
+    if (!input || !spinnerWrap) return;
+    const measure = getUserSelectMeasureSpan();
+    if (!measure) return;
+    const style = window.getComputedStyle(input);
+    measure.style.fontSize = style.fontSize;
+    measure.style.fontFamily = style.fontFamily;
+    measure.style.fontWeight = style.fontWeight;
+    measure.style.letterSpacing = style.letterSpacing;
+    measure.textContent = input.value || input.placeholder || '';
+    const paddingLeft = parseFloat(style.paddingLeft) || 0;
+    const paddingRight = parseFloat(style.paddingRight) || 0;
+    const inputWidth = input.clientWidth || 0;
+    const textWidth = measure.offsetWidth || 0;
+    const spinnerWidth = spinnerWrap.offsetWidth || 14;
+    let left = paddingLeft + textWidth + 6;
+    const maxLeft = Math.max(paddingLeft, inputWidth - paddingRight - spinnerWidth);
+    if (!Number.isFinite(left)) left = paddingLeft;
+    left = Math.min(left, maxLeft);
+    left = Math.max(paddingLeft, left);
+    spinnerWrap.style.left = `${left}px`;
+    spinnerWrap.style.right = 'auto';
+  }
+
+  function syncUserSelectHydrateIndicator(){
+    const el = getUserSelectHydrateIndicator();
+    if (!el) return;
+    const active = isHydratingPosts || isHydratingMetrics || isMetricsPartial;
+    if (active) {
+      el.classList.add('is-active');
+      el.setAttribute('aria-hidden', 'false');
+    } else {
+      el.classList.remove('is-active');
+      el.setAttribute('aria-hidden', 'true');
+    }
+    updateUserSelectHydrateIndicatorPosition();
+  }
+
+  function setPostsHydrateState(active){
+    isHydratingPosts = !!active;
+    const el = getPostsHydrateIndicator();
+    if (!el) return;
+    if (isHydratingPosts) {
+      el.classList.add('is-active');
+      el.setAttribute('aria-hidden', 'false');
+    } else {
+      el.classList.remove('is-active');
+      el.setAttribute('aria-hidden', 'true');
+    }
+    syncUserSelectHydrateIndicator();
+  }
+
+  function setMetricsHydrateState(active){
+    isHydratingMetrics = !!active;
+    syncUserSelectHydrateIndicator();
+  }
+
   function formatPostCount(count){
     const num = Number(count) || 0;
     return `${num} ${num === 1 ? 'post' : 'posts'}`;
@@ -1327,11 +1839,28 @@
     return `${name} - ${formatPostCount(count)}`;
   }
 
+  function getUserDisplayLabel(userKey, user){
+    if (!userKey) return '';
+    if (isTopTodayKey(userKey)) return EVERYONE_LABEL;
+    if (isCameoKey(userKey)) {
+      const cameoName = user?.handle || cameoNameFromKey(userKey) || userKey;
+      return formatCameoLabel(cameoName);
+    }
+    return user?.handle || userKey;
+  }
+
+  function getUserHandleLabel(userKey, user){
+    if (!userKey) return '';
+    if (isTopTodayKey(userKey)) return 'Top Today';
+    if (isCameoKey(userKey)) return user?.handle || cameoNameFromKey(userKey) || userKey;
+    return user?.handle || userKey;
+  }
+
   function formatUserSelectionLabel(userKey, user){
     if (!userKey) return '';
     const meta = user || findUserIndexEntry(userKey);
-    const count = countUserPosts(meta);
-    const name = isTopTodayKey(userKey) ? EVERYONE_LABEL : (meta?.handle || user?.handle || userKey);
+    const count = countUserPosts(user || meta);
+    const name = getUserDisplayLabel(userKey, user || meta);
     return formatUserOptionLabel(name, count);
   }
 
@@ -1346,6 +1875,10 @@
     const list = filterUsersByQuery(metrics, query);
     for (const [key, u] of list){
       items.push({ key, label: u.handle || key, count: countUserPosts(u) });
+    }
+    const cameoList = getCameoSuggestionItems(metrics, query);
+    for (const cameo of cameoList){
+      items.push(cameo);
     }
     return items;
   }
@@ -1577,10 +2110,11 @@
   function computeOrderedPosts(user, visibleSet, activeActionId){
     if (!user) return [];
     const isTopToday = user?.__specialKey === TOP_TODAY_KEY;
+    const isVirtual = isVirtualUser(user);
     // Build and sort: known-dated posts first (newest -> oldest), undated go to bottom
     const mapped = Object.entries(user.posts||{}).map(([pid,p])=>{
       const last = latestSnapshot(p.snapshots) || {};
-      const postTime = (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0;
+      const postTime = (isVirtual ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0;
       const rate = interactionRate(last);
       const bi = pidBigInt(pid);
       const views = num(last?.views);
@@ -1588,7 +2122,7 @@
       const lastSeen = p?.lastSeen || 0;
       const cap = (typeof p?.caption === 'string' && p.caption) ? p.caption.trim() : null;
       const cameos = Array.isArray(p?.cameo_usernames) ? p.cameo_usernames.filter(c => typeof c === 'string' && c.trim()) : [];
-      const owner = user?.__specialKey === TOP_TODAY_KEY ? (p?.ownerHandle || '') : (user?.handle || '');
+      const owner = isVirtual ? (p?.ownerHandle || '') : (user?.handle || '');
 
       let label, title;
       const captionText = cap || pid;
@@ -1684,7 +2218,7 @@
 
   function computeVisibleSetForAction(user, actionId){
     if (!user || !actionId) return null;
-    const isTopToday = isTopTodayKey(currentUserKey);
+    const useRecencyFallback = isVirtualUserKey(currentUserKey);
     const posts = user.posts || {};
     const makeSetFrom = (arr)=> {
       const s = new Set();
@@ -1699,7 +2233,7 @@
       const cutoff = now - windowMs;
       const mapped = Object.entries(posts).map(([pid,p])=>({
         pid,
-        postTime: (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
+        postTime: (useRecencyFallback ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
         pidBI: pidBigInt(pid)
       }));
       const sorted = mapped.filter(x=>x.postTime>0 && x.postTime >= cutoff).sort((a,b)=>{
@@ -1713,7 +2247,7 @@
     if (actionId === 'last5' || actionId === 'last10'){
       const mapped = Object.entries(posts).map(([pid,p])=>({
         pid,
-        postTime: (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
+        postTime: (useRecencyFallback ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
         pidBI: pidBigInt(pid)
       }));
       const withTs = mapped.filter(x=>x.postTime>0).sort((a,b)=>b.postTime - a.postTime);
@@ -1965,7 +2499,7 @@
     wrap._sctSeparatorContext = { user };
 
     const prevRects = new Map();
-    const animTargets = Array.from(wrap.querySelectorAll('.post, .posts-separator'));
+        const animTargets = Array.from(wrap.querySelectorAll('.post, .posts-separator'));
     for (const el of animTargets) {
       prevRects.set(el, el.getBoundingClientRect());
     }
@@ -2035,16 +2569,20 @@
       }
       wrap.appendChild(sep);
     }
+    const hydrateEl = getPostsHydrateIndicator();
+    if (hydrateEl) wrap.appendChild(hydrateEl);
 
     if (prevRects.size > 0) {
+      const MAX_FLIP_TRAVEL = 500;
       requestAnimationFrame(()=>{
         for (const el of animTargets) {
           const prev = prevRects.get(el);
           if (!prev || !document.body.contains(el)) continue;
           const next = el.getBoundingClientRect();
-          const dx = prev.left - next.left;
-          const dy = prev.top - next.top;
+          let dx = prev.left - next.left;
+          let dy = prev.top - next.top;
           if (!dx && !dy) continue;
+          if (Math.abs(dx) > MAX_FLIP_TRAVEL || Math.abs(dy) > MAX_FLIP_TRAVEL) continue;
           el.style.transition = 'none';
           el.style.transform = `translate(${dx}px, ${dy}px)`;
           requestAnimationFrame(()=>{
@@ -2186,6 +2724,7 @@
   function computeSeriesForUser(user, selectedPIDs, colorFor, useUniqueViews = true){
     const series=[];
     const entries = Object.entries(user.posts||{});
+    const isVirtual = isVirtualUser(user);
     for (let i=0;i<entries.length;i++){
       const [pid, p] = entries[i];
       const pts = [];
@@ -2195,7 +2734,7 @@
         if (viewValue != null && r != null) pts.push({ x:viewValue, y:r, t:s.t });
       }
       const color = typeof colorFor === 'function' ? colorFor(pid) : getPaletteColor(i);
-      const owner = user?.__specialKey === TOP_TODAY_KEY ? (p?.ownerHandle || '') : (user?.handle || '');
+      const owner = isVirtual ? (p?.ownerHandle || '') : (user?.handle || '');
       const label = buildPostLabel({ ...p, id: pid }, owner);
       if (pts.length) series.push({ id: pid, label, color, points: pts, highlighted: selectedPIDs.includes(pid) });
     }
@@ -4726,18 +5265,22 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     initThemePicker();
     hoistChartTooltips();
     const cached = prefetchedCache !== undefined ? prefetchedCache : loadInstantCache();
+    const hasBootCache = !!cached;
     if (cached) {
       metrics = { users: { [cached.userKey]: cached.user } };
       usersIndex = cached.usersIndex;
       currentUserKey = cached.userKey;
       lastMetricsUpdatedAt = cached.metricsUpdatedAt || 0;
       isMetricsPartial = true;
+      trackLastSelectedUserKey();
+      hydrateCurrentUserPostsFromStorage();
     } else {
       const perfLoad = perfStart('load metrics');
       metrics = await loadMetrics();
       perfEnd(perfLoad);
       isMetricsPartial = false;
     }
+    syncUserSelectHydrateIndicator();
     const perfUltra = perfStart('load ultra mode');
     let ultraModeEnabled = false;
     const ultraModePromise = loadUltraModePreference()
@@ -4766,6 +5309,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     // Build list and try to restore last user
     const defaultUserKey = buildUserOptions(metrics);
     if (!currentUserKey) currentUserKey = defaultUserKey;
+    trackLastSelectedUserKey();
     const searchInput = $('#search');
     const suggestions = $('#suggestions');
     let zoomStates = {};
@@ -4773,7 +5317,20 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     let customFiltersByUser = {};
     let customFiltersReloaded = false;
     let lastFilterAction = (function(){
-      try { return sessionStorage.getItem('sctLastFilterAction') || null; } catch { return null; }
+      try {
+        return sessionStorage.getItem('sctLastFilterAction')
+          || localStorage.getItem('sctLastFilterAction')
+          || null;
+      } catch { return null; }
+    })();
+    let lastFilterActionByUser = (function(){
+      try {
+        const raw = sessionStorage.getItem('sctLastFilterActionByUser')
+          || localStorage.getItem('sctLastFilterActionByUser')
+          || '{}';
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch { return {}; }
     })();
     const sessionCustomFiltersByUser = (function(){
       try { return JSON.parse(sessionStorage.getItem('customFiltersByUserSession') || '{}'); } catch { return {}; }
@@ -4781,18 +5338,30 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     const localCustomFiltersByUser = (function(){
       try { return JSON.parse(localStorage.getItem('sctCustomFiltersByUser') || '{}'); } catch { return {}; }
     })();
+    customFiltersByUser = localCustomFiltersByUser;
+    for (const [userKey, entry] of Object.entries(sessionCustomFiltersByUser)){
+      const existing = customFiltersByUser[userKey];
+      const existingCount = Array.isArray(existing?.filters) ? existing.filters.length : 0;
+      const sessionCount = Array.isArray(entry?.filters) ? entry.filters.length : 0;
+      if (!existing || sessionCount > existingCount) {
+        customFiltersByUser[userKey] = entry;
+      }
+    }
     const prefsPromise = chrome.storage.local
-      .get(['lastUserKey', 'zoomStates', 'customVisibilityByUser', 'customFiltersByUser', 'lastFilterAction'])
+      .get(['lastUserKey', 'zoomStates', 'customVisibilityByUser', 'customFiltersByUser', 'lastFilterAction', 'lastFilterActionByUser', VIEWS_TYPE_STORAGE_KEY, BEST_TIME_PREFS_KEY])
       .catch(() => ({}));
     syncUserSelectionUI();
-    let viewsChartType = 'total'; // 'unique' or 'total'
-    let compareViewsChartType = 'total';
-    let chart = makeChart($('#chart'), 'Viewers', 'Viewers');
+    const initialViewsChartType = loadViewsChartType();
+    let viewsChartType = initialViewsChartType || 'total'; // 'unique' or 'total'
+    let viewsChartTypeLoaded = !!initialViewsChartType;
+    let compareViewsChartType = viewsChartType;
+    const viewsAxisLabel = viewsChartType === 'unique' ? 'Viewers' : 'Total Views';
+    let chart = makeChart($('#chart'), viewsAxisLabel, viewsAxisLabel);
     let viewsPerPersonChart = makeFirst24HoursChart($('#viewsPerPersonChart'), '#viewsPerPersonTooltip', 'Views Per Person', (v) => Number(v).toFixed(2));
-    let viewsChart = makeTimeChart($('#viewsChart'), '#viewsTooltip', 'Viewers', fmt);
-    let first24HoursChart = makeFirst24HoursChart($('#first24HoursChart'), '#first24HoursTooltip', 'Viewers', fmt);
+    let viewsChart = makeTimeChart($('#viewsChart'), '#viewsTooltip', viewsAxisLabel, fmt);
+    let first24HoursChart = makeFirst24HoursChart($('#first24HoursChart'), '#first24HoursTooltip', viewsAxisLabel, fmt);
     const followersChart = makeFollowersChart($('#followersChart'));
-    let allViewsChart = makeTimeChart($('#allViewsChart'), '#allViewsTooltip', 'Total Views', fmt2);
+    let allViewsChart = makeTimeChart($('#allViewsChart'), '#allViewsTooltip', viewsAxisLabel, fmt2);
     const allLikesChart = makeTimeChart($('#allLikesChart'), '#allLikesTooltip', 'Likes', fmt2);
     const cameosChart = makeTimeChart($('#cameosChart'), '#cameosTooltip', 'Cast in', fmt2);
     const PRESET_VISIBILITY_ACTIONS = new Set(['pastDay','pastWeek','last5','last10','top5','top10','bottom5','bottom10','stale']);
@@ -4812,9 +5381,21 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (!next) return;
       lastFilterAction = next;
       try { sessionStorage.setItem('sctLastFilterAction', next); } catch {}
-      try { chrome.storage.local.set({ lastFilterAction: next }); } catch {}
+      try { localStorage.setItem('sctLastFilterAction', next); } catch {}
+      if (currentUserKey) {
+        lastFilterActionByUser[currentUserKey] = next;
+        try { sessionStorage.setItem('sctLastFilterActionByUser', JSON.stringify(lastFilterActionByUser)); } catch {}
+        try { localStorage.setItem('sctLastFilterActionByUser', JSON.stringify(lastFilterActionByUser)); } catch {}
+      }
+      try { chrome.storage.local.set({ lastFilterAction: next, lastFilterActionByUser }); } catch {}
     }
-    function getSessionFilterAction(){
+    function getSavedFilterActionForUser(userKey){
+      if (!userKey) return null;
+      return normalizeFilterAction(lastFilterActionByUser?.[userKey]);
+    }
+    function getSessionFilterAction(userKey = currentUserKey){
+      const byUser = getSavedFilterActionForUser(userKey);
+      if (byUser) return byUser;
       const normalized = normalizeFilterAction(lastFilterAction);
       if (!normalized) return 'showAll';
       return normalized;
@@ -4840,6 +5421,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (!isCustomFilterAction(action)) return null;
       return action.slice(CUSTOM_FILTER_PREFIX.length);
     }
+    function isCoreVisibilitySource(source){
+      return source === 'showAll' || source === 'hideAll' || isPresetVisibilitySource(source);
+    }
     function getCustomFiltersForUser(userKey){
       const entry = customFiltersByUser?.[userKey];
       const filters = Array.isArray(entry?.filters) ? entry.filters : [];
@@ -4851,6 +5435,14 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       try { sessionStorage.setItem('customFiltersByUserSession', JSON.stringify(customFiltersByUser)); } catch {}
       try { localStorage.setItem('sctCustomFiltersByUser', JSON.stringify(customFiltersByUser)); } catch {}
       try { chrome.storage.local.set({ customFiltersByUser }); } catch {}
+    }
+    function createAutoCustomFilterForUser(userKey, ids){
+      if (!userKey) return null;
+      const filters = getCustomFiltersForUser(userKey).slice();
+      const id = `cf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      filters.push({ id, name: 'Custom', ids: Array.from(ids || []) });
+      setCustomFiltersForUser(userKey, filters);
+      return id;
     }
     function updateCustomFilterIdsForUser(userKey, filterId, ids){
       if (!userKey || !filterId) return;
@@ -4871,6 +5463,11 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     function wireCustomFilterInput(input){
       if (!input) return;
       let committed = false;
+      const syncWidth = ()=>{
+        input.style.width = '1px';
+        const nextWidth = input.scrollWidth || 1;
+        input.style.width = `${nextWidth + 2}px`;
+      };
       const finalize = (commit)=>{
         const name = input.value.trim().slice(0, 16);
         if (committed) return;
@@ -4898,14 +5495,69 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         if (e.key === 'Enter') { e.preventDefault(); finalize(true); }
         if (e.key === 'Escape') { e.preventDefault(); finalize(false); }
       });
+      input.addEventListener('input', syncWidth);
       input.addEventListener('blur', ()=> { if (!committed) finalize(false); });
+      syncWidth();
+    }
+    function wireCustomFilterRenameInput(input, userKey, filterId, fallbackName){
+      if (!input) return;
+      let committed = false;
+      const syncWidth = ()=>{
+        input.style.width = '1px';
+        const nextWidth = input.scrollWidth || 1;
+        input.style.width = `${nextWidth + 2}px`;
+      };
+      const finalize = (commit)=>{
+        if (committed) return;
+        committed = true;
+        const name = input.value.trim().slice(0, 16) || fallbackName;
+        input.remove();
+        if (!commit || !name) { renderCustomFilters(userKey); return; }
+        if (!userKey) { renderCustomFilters(userKey); return; }
+        const filters = getCustomFiltersForUser(userKey).slice();
+        const idx = filters.findIndex(f => f.id === filterId);
+        if (idx < 0) { renderCustomFilters(userKey); return; }
+        filters[idx] = { ...filters[idx], name };
+        setCustomFiltersForUser(userKey, filters);
+        renderCustomFilters(userKey);
+      };
+      input.addEventListener('keydown', (e)=>{
+        if (e.key === 'Enter') { e.preventDefault(); finalize(true); }
+        if (e.key === 'Escape') { e.preventDefault(); finalize(false); }
+      });
+      input.addEventListener('input', syncWidth);
+      input.addEventListener('blur', ()=> { if (!committed) finalize(true); });
+      syncWidth();
+      requestAnimationFrame(()=>input.select());
+    }
+    function beginCustomFilterRename(userKey, filterId, currentName, button){
+      if (!userKey || !filterId || !button) return;
+      const wrap = $('#customFiltersWrap');
+      if (!wrap) return;
+      const existing = wrap.querySelector('.custom-filter-input--rename');
+      if (existing) { existing.focus(); return; }
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.maxLength = 16;
+      input.className = 'custom-filter-input custom-filter-input--rename';
+      input.value = currentName;
+      input.dataset.filterId = filterId;
+      if (button.classList.contains('active')) input.classList.add('active');
+      wrap.replaceChild(input, button);
+      wireCustomFilterRenameInput(input, userKey, filterId, currentName);
+      input.focus();
     }
     function renderCustomFilters(userKey){
       const wrap = $('#customFiltersWrap');
       if (!wrap) return;
-      const pendingInput = wrap.querySelector('.custom-filter-input');
+      document.querySelectorAll('.custom-filter-tooltip').forEach((el)=>el.remove());
+      const pendingInput = wrap.querySelector('.custom-filter-input--new');
       const pendingValue = pendingInput ? pendingInput.value : '';
       const wasFocused = pendingInput ? document.activeElement === pendingInput : false;
+      const pendingRenameInput = wrap.querySelector('.custom-filter-input--rename');
+      const pendingRenameValue = pendingRenameInput ? pendingRenameInput.value : '';
+      const pendingRenameId = pendingRenameInput ? pendingRenameInput.dataset.filterId : '';
+      const renameWasFocused = pendingRenameInput ? document.activeElement === pendingRenameInput : false;
       wrap.innerHTML = '';
       if (!userKey) return;
       let filters = getCustomFiltersForUser(userKey);
@@ -4924,6 +5576,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       const activeId = getCustomFilterId(currentVisibilitySource);
       let tooltipTimer = null;
       let tooltipEl = null;
+      let lastMouse = null;
+      let renameTimer = null;
       const hideTooltip = ()=>{
         if (tooltipTimer) {
           clearTimeout(tooltipTimer);
@@ -4931,37 +5585,95 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         }
         if (tooltipEl) tooltipEl.style.display = 'none';
       };
-      const showTooltip = (target, text)=>{
+      const clearRenameTimer = ()=>{
+        if (renameTimer) {
+          clearTimeout(renameTimer);
+          renameTimer = null;
+        }
+      };
+      const positionTooltip = (x, y)=>{
+        if (!tooltipEl) return;
+        const width = tooltipEl.offsetWidth || 0;
+        const left = Math.max(8, Math.min(window.innerWidth - width - 8, x - width / 2));
+        tooltipEl.style.left = left + 'px';
+        tooltipEl.style.top = (y + 8) + 'px';
+      };
+      const showTooltip = (target, text, className = 'tooltip', point)=>{
+        if (!target || !target.isConnected) {
+          hideTooltip();
+          return;
+        }
         if (!tooltipEl) {
           tooltipEl = document.createElement('div');
-          tooltipEl.className = 'tooltip';
+          tooltipEl.className = className;
           document.body.appendChild(tooltipEl);
+        } else {
+          tooltipEl.className = className;
         }
         tooltipEl.textContent = text;
-        const r = target.getBoundingClientRect();
         tooltipEl.style.display = 'block';
-        const width = tooltipEl.offsetWidth || 0;
-        const left = Math.max(8, Math.min(window.innerWidth - width - 8, r.left + r.width / 2 - width / 2));
-        tooltipEl.style.left = left + 'px';
-        tooltipEl.style.top = (r.bottom + 8) + 'px';
+        if (point && Number.isFinite(point.x) && Number.isFinite(point.y)) {
+          positionTooltip(point.x, point.y);
+        } else {
+          const r = target.getBoundingClientRect();
+          positionTooltip(r.left + r.width / 2, r.bottom);
+        }
       };
-      const wireTooltip = (el, text)=>{
+      const startHoverTooltip = (el, text, className, shouldShow)=>{
         if (!el) return;
-        el.addEventListener('mouseenter', ()=>{
-          if (tooltipTimer) clearTimeout(tooltipTimer);
-          tooltipTimer = setTimeout(()=>showTooltip(el, text), 500);
+        if (typeof shouldShow === 'function' && !shouldShow(el)) return;
+        const tooltipText = typeof text === 'function' ? text(el) : text;
+        if (!tooltipText) return;
+        if (tooltipTimer) clearTimeout(tooltipTimer);
+        tooltipTimer = setTimeout(()=>showTooltip(el, tooltipText, className, lastMouse), 500);
+      };
+      const wireTooltip = (el, text, className, shouldShow)=>{
+        if (!el) return;
+        el.addEventListener('mouseenter', (e)=>{
+          el._sctHovering = true;
+          lastMouse = { x: e.clientX, y: e.clientY };
+          startHoverTooltip(el, text, className, shouldShow);
         });
-        el.addEventListener('mouseleave', hideTooltip);
+        el.addEventListener('mousemove', (e)=>{
+          lastMouse = { x: e.clientX, y: e.clientY };
+          if (tooltipEl && tooltipEl.style.display === 'block') {
+            positionTooltip(e.clientX, e.clientY);
+          }
+        });
+        el.addEventListener('mouseleave', ()=>{
+          el._sctHovering = false;
+          hideTooltip();
+        });
         el.addEventListener('blur', hideTooltip);
       };
       filters.forEach((f)=>{
+        if (pendingRenameId && pendingRenameId === f.id) {
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.maxLength = 16;
+          input.className = 'custom-filter-input custom-filter-input--rename';
+          input.value = pendingRenameValue || f.name;
+          input.dataset.filterId = f.id;
+          if (activeId && activeId === f.id) input.classList.add('active');
+          wrap.appendChild(input);
+          wireCustomFilterRenameInput(input, userKey, f.id, f.name);
+          if (renameWasFocused) input.focus();
+          return;
+        }
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'custom-filter-btn';
         btn.textContent = f.name;
         btn.dataset.filterId = f.id;
         if (activeId && activeId === f.id) btn.classList.add('active');
+        const getCustomFilterTooltipText = (el)=>(
+          el && el.classList.contains('active')
+            ? 'Click to Rename\nDouble Click to Reset'
+            : 'A filter you created'
+        );
         btn.addEventListener('click', ()=>{
+          clearRenameTimer();
+          const wasActive = btn.classList.contains('active');
           if (!userKey) return;
           const user = resolveUserForKey(metrics, userKey);
           if (!user) return;
@@ -4970,8 +5682,21 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           setCustomFilterActive(f.id);
           refreshUserUI({ preserveEmpty: true });
           persistVisibility();
+          if (btn._sctHovering) {
+            startHoverTooltip(
+              btn,
+              getCustomFilterTooltipText,
+              'tooltip custom-filter-tooltip'
+            );
+          }
+          if (wasActive) {
+            renameTimer = setTimeout(()=>{
+              beginCustomFilterRename(userKey, f.id, f.name, btn);
+            }, 350);
+          }
         });
         btn.addEventListener('dblclick', ()=>{
+          clearRenameTimer();
           const next = getCustomFiltersForUser(userKey).filter(it=>it.id !== f.id);
           setCustomFiltersForUser(userKey, next);
           if (getCustomFilterId(currentVisibilitySource) === f.id){
@@ -4981,18 +5706,16 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           }
           renderCustomFilters(userKey);
         });
-        wireTooltip(btn, 'Double-click to Reset');
+        wireTooltip(btn, getCustomFilterTooltipText, 'tooltip custom-filter-tooltip');
         wrap.appendChild(btn);
       });
       setCustomFilterActive(activeId);
-      const saveBtn = $('#saveCustomFilter');
-      wireTooltip(saveBtn, 'Create Custom Filter');
       if (pendingInput) {
         const input = document.createElement('input');
         input.type = 'text';
         input.maxLength = 16;
         input.placeholder = 'Name your filter...';
-        input.className = 'custom-filter-input';
+        input.className = 'custom-filter-input custom-filter-input--new';
         input.value = pendingValue;
         wrap.appendChild(input);
         wireCustomFilterInput(input);
@@ -5002,16 +5725,16 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     function isPresetVisibilitySource(source){
       return PRESET_VISIBILITY_ACTIONS.has(source);
     }
-    function buildPresetIds(action, user){
-      if (!user) return [];
-      const isTopToday = user?.__specialKey === TOP_TODAY_KEY;
+  function buildPresetIds(action, user){
+    if (!user) return [];
+    const isVirtual = isVirtualUser(user);
       if (action === 'pastDay' || action === 'pastWeek'){
         const now = Date.now();
         const windowMs = action === 'pastDay' ? (24 * 60 * 60 * 1000) : (7 * 24 * 60 * 60 * 1000);
         const cutoff = now - windowMs;
         const mapped = Object.entries(user.posts||{}).map(([pid,p])=>({
           pid,
-          postTime: (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
+        postTime: (isVirtual ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
           pidBI: pidBigInt(pid)
         }));
         const sorted = mapped.filter(x=>x.postTime>0 && x.postTime >= cutoff).sort((a,b)=>{
@@ -5025,7 +5748,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (action === 'last5' || action === 'last10'){
         const mapped = Object.entries(user.posts||{}).map(([pid,p])=>({
           pid,
-          postTime: (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
+        postTime: (isVirtual ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
           pidBI: pidBigInt(pid)
         }));
         const withTs = mapped.filter(x=>x.postTime>0).sort((a,b)=>b.postTime - a.postTime);
@@ -5282,7 +6005,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       setCompareNextColor(getCompareSeriesColor(users.length));
       users.forEach((userKey, idx)=>{
         const user = resolveUserForKey(metrics, userKey);
-        const handle = user?.handle || (isTopTodayKey(userKey) ? 'Top Today' : userKey);
+        const handle = getUserDisplayLabel(userKey, user);
         const pill = document.createElement('div');
         pill.className = 'compare-pill';
         pill.dataset.userKey = userKey;
@@ -5379,7 +6102,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           })();
           if (pts.length){
             const color = getCompareSeriesColor(idx);
-            const handle = user.handle || (isTopTodayKey(userKey) ? 'Top Today' : userKey);
+            const handle = getUserHandleLabel(userKey, user);
             const profileUrl = handle ? `${SITE_ORIGIN}/profile/${handle}` : null;
             const isTopToday = isTopTodayKey(userKey);
             const label = isTopToday
@@ -5423,7 +6146,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           })();
           if (ptsLikes.length){
             const color = getCompareSeriesColor(idx);
-            const handle = user.handle || (isTopTodayKey(userKey) ? 'Top Today' : userKey);
+            const handle = getUserHandleLabel(userKey, user);
             const profileUrl = handle ? `${SITE_ORIGIN}/profile/${handle}` : null;
             const isTopToday = isTopTodayKey(userKey);
             allSeries.push({ id: userKey, label: isTopToday ? 'Top Today • Likes' : `@${handle}'s Likes`, color, points: ptsLikes, profileUrl: isTopToday ? null : profileUrl });
@@ -5438,11 +6161,15 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         userKeys.forEach((userKey, idx)=>{
           const user = resolveUserForKey(metrics, userKey);
           if (!user) return;
-          const arr = Array.isArray(user.cameos) ? user.cameos : [];
+          let arr = Array.isArray(user.cameos) ? user.cameos : [];
+          if ((!arr || !arr.length) && isCameoKey(userKey)) {
+            const fallbackUser = findUserByHandle(metrics, user?.handle || cameoNameFromKey(userKey));
+            arr = Array.isArray(fallbackUser?.cameos) ? fallbackUser.cameos : arr;
+          }
           const pts = arr.map(it=>({ x:Number(it.t), y:Number(it.count), t:Number(it.t) })).filter(p=>isFinite(p.x)&&isFinite(p.y));
           if (pts.length){
             const color = getCompareSeriesColor(idx);
-            const handle = user.handle || (isTopTodayKey(userKey) ? 'Top Today' : userKey);
+            const handle = getUserHandleLabel(userKey, user);
             const profileUrl = handle ? `${SITE_ORIGIN}/profile/${handle}` : null;
             const isTopToday = isTopTodayKey(userKey);
             allSeries.push({ id: userKey, label: isTopToday ? 'Top Today • Cast in' : `@${handle}'s Cast in`, color, points: pts, profileUrl: isTopToday ? null : profileUrl });
@@ -5461,7 +6188,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           const pts = arr.map(it=>({ x:Number(it.t), y:Number(it.count), t:Number(it.t) })).filter(p=>isFinite(p.x)&&isFinite(p.y));
           if (pts.length){
             const color = getCompareSeriesColor(idx);
-            const handle = user.handle || (isTopTodayKey(userKey) ? 'Top Today' : userKey);
+            const handle = getUserHandleLabel(userKey, user);
             const profileUrl = handle ? `${SITE_ORIGIN}/profile/${handle}` : null;
             const isTopToday = isTopTodayKey(userKey);
             allSeries.push({ id: userKey, label: isTopToday ? 'Top Today • Followers' : `@${handle}'s Followers`, color, points: pts, profileUrl: isTopToday ? null : profileUrl });
@@ -6159,7 +6886,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           hide();
           return;
         }
-        if (activeCell !== cell) activeCell = cell;
+        activeCell = cell;
         showAt(cell, e.clientX, e.clientY);
       });
       heatmapEl.addEventListener('mouseleave', hide);
@@ -6174,7 +6901,13 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         bestTimeInfoTooltip.style.display = 'none';
         document.body.appendChild(bestTimeInfoTooltip);
       }
+      let showTimer = null;
+      let lastPoint = null;
       const hide = ()=>{
+        if (showTimer) {
+          clearTimeout(showTimer);
+          showTimer = null;
+        }
         if (bestTimeInfoTooltip) bestTimeInfoTooltip.style.display = 'none';
       };
       const showAt = (clientX, clientY)=>{
@@ -6192,7 +6925,17 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         const rect = infoEl.getBoundingClientRect();
         const x = (e && typeof e.clientX === 'number') ? e.clientX : (rect.left + rect.width / 2);
         const y = (e && typeof e.clientY === 'number') ? e.clientY : rect.bottom;
-        showAt(x, y);
+        lastPoint = { x, y };
+        if (bestTimeInfoTooltip && bestTimeInfoTooltip.style.display === 'block') {
+          showAt(x, y);
+          return;
+        }
+        if (showTimer) return;
+        showTimer = setTimeout(()=>{
+          showTimer = null;
+          if (!lastPoint) return;
+          showAt(lastPoint.x, lastPoint.y);
+        }, 500);
       };
       infoEl.addEventListener('mouseenter', show);
       infoEl.addEventListener('mousemove', show);
@@ -6403,11 +7146,14 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         data.heatmap.matrix.forEach((row, dayIdx)=>{
           const rowEl = document.createElement('div');
           rowEl.className = 'best-time-heatmap-row';
+          const dayWrap = document.createElement('div');
+          dayWrap.className = 'best-time-heatmap-day-wrap';
           const dayEl = document.createElement('div');
           dayEl.className = 'best-time-heatmap-day';
           dayEl.textContent = dayNamesShort[dayIdx];
           if (dayStr.startsWith(dayNamesShort[dayIdx])) dayEl.classList.add('highlight');
-          rowEl.appendChild(dayEl);
+          dayWrap.appendChild(dayEl);
+          rowEl.appendChild(dayWrap);
           const cells = document.createElement('div');
           cells.className = 'best-time-heatmap-cells';
           row.forEach((v, colIdx)=>{
@@ -6520,6 +7266,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       const user = resolveUserForKey(metrics, currentUserKey);
       if (!user) return;
       const colorFor = makeColorMap(user);
+      const isVirtual = isVirtualUser(user);
       const useUnique = viewsChartType === 'unique';
       const f24Series = (function(){
         const out=[]; for (const [pid,p] of Object.entries(user.posts||{})){
@@ -6531,7 +7278,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             const v=useUnique ? s.uv : s.views; 
             if (t!=null && v!=null) pts.push({ x:Number(t), y:Number(v), t:Number(t) }); 
           }
-          const owner = user?.__specialKey === TOP_TODAY_KEY ? (p?.ownerHandle || '') : (user?.handle || '');
+          const owner = isVirtual ? (p?.ownerHandle || '') : (user?.handle || '');
           const color=colorFor(pid); const label = buildPostLabel({ ...p, id: pid }, owner);
           // Include all posts with post_time, even if they have no snapshots or no snapshots in the time window
           out.push({ id: pid, label, color, points: pts, url: absUrl(p.url, pid), postTime: postTime }); }
@@ -6551,6 +7298,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       const user = resolveUserForKey(metrics, currentUserKey);
       if (!user) return;
       const colorFor = makeColorMap(user);
+      const isVirtual = isVirtualUser(user);
       const vppSeries = (function(){
         const out=[]; for (const [pid,p] of Object.entries(user.posts||{})){
           if (!visibleSet.has(pid)) continue;
@@ -6566,7 +7314,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
               pts.push({ x:Number(t), y:vpp, t:Number(t) }); 
             }
           }
-          const owner = user?.__specialKey === TOP_TODAY_KEY ? (p?.ownerHandle || '') : (user?.handle || '');
+          const owner = isVirtual ? (p?.ownerHandle || '') : (user?.handle || '');
           const color=colorFor(pid); const label = buildPostLabel({ ...p, id: pid }, owner);
           // Include all posts with post_time, even if they have no snapshots or no snapshots in the time window
           out.push({ id: pid, label, color, points: pts, url: absUrl(p.url, pid), postTime: postTime }); }
@@ -6576,7 +7324,11 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
 
     function updateStaleButtonCount(user){
       const staleBtn = $('#stale');
-      if (!staleBtn || !user) return;
+      if (!staleBtn) return;
+      if (!user) {
+        staleBtn.style.display = 'none';
+        return;
+      }
       const now = Date.now();
       const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
       const count = Object.entries(user.posts||{}).reduce((acc, [,p])=>{
@@ -6585,12 +7337,170 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         return acc + (ageMs > TWENTY_FOUR_HOURS_MS ? 1 : 0);
       }, 0);
       staleBtn.textContent = `Stale (${count})`;
+      staleBtn.style.display = count > 0 ? '' : 'none';
+    }
+
+    function hydrateCurrentUserPostsFromStorage(){
+      if (!currentUserKey || isVirtualUserKey(currentUserKey)) return;
+      const hydrateKey = currentUserKey;
+      const hydrateToken = ++postHydrationToken;
+      setPostsHydrateState(true);
+      const chunkSize = 200;
+      const chunkBudgetMs = 14;
+      const uiThrottleMs = 200;
+      let lastUiAt = 0;
+      let entries = null;
+      let storedUser = null;
+      let targetUser = null;
+      let idx = 0;
+      let postCount = 0;
+
+      const tick = () => {
+        if (postHydrationToken !== hydrateToken) return;
+        if (!entries || !targetUser || currentUserKey !== hydrateKey) return;
+        const posts = targetUser.posts || (targetUser.posts = {});
+        const start = performance.now();
+        let processed = 0;
+        while (idx < entries.length) {
+          const [pid, post] = entries[idx++];
+          if (!Object.prototype.hasOwnProperty.call(posts, pid)) postCount++;
+          posts[pid] = post;
+          processed++;
+          if (processed >= chunkSize || (performance.now() - start) >= chunkBudgetMs) break;
+        }
+        const now = performance.now();
+        if (processed && (now - lastUiAt >= uiThrottleMs || idx >= entries.length)) {
+          syncUserOptionCount(hydrateKey, postCount);
+          refreshUserUI({ preserveEmpty: true, skipRestoreZoom: true, autoRefresh: true, skipCharts: true, skipPostListRebuild: true });
+          lastUiAt = now;
+        }
+        if (idx < entries.length) {
+          setTimeout(tick, 0);
+        } else {
+          if (Array.isArray(storedUser.followers)) targetUser.followers = storedUser.followers;
+          if (Array.isArray(storedUser.cameos)) targetUser.cameos = storedUser.cameos;
+          syncUserOptionCount(hydrateKey, postCount);
+          setPostsHydrateState(false);
+          refreshUserUI({ preserveEmpty: true, skipRestoreZoom: true, autoRefresh: true });
+        }
+      };
+
+      setTimeout(async () => {
+        if (postHydrationToken !== hydrateToken || currentUserKey !== hydrateKey) return;
+        try {
+          const { metrics: storedMetrics } = await chrome.storage.local.get('metrics');
+          storedUser = storedMetrics?.users?.[hydrateKey];
+          targetUser = metrics?.users?.[hydrateKey];
+          const storedPosts = storedUser?.posts;
+          if (!storedPosts || !targetUser) {
+            setPostsHydrateState(false);
+            return;
+          }
+          postCount = Object.keys(targetUser.posts || {}).length;
+          entries = Object.entries(storedPosts);
+          if (!entries.length) {
+            setPostsHydrateState(false);
+            return;
+          }
+          tick();
+        } catch {}
+      }, 0);
+    }
+
+    function hydrateMetricsFromStorageInChunks(){
+      if (!isMetricsPartial || isHydratingMetrics) return Promise.resolve(false);
+      const hydrateToken = ++metricsHydrationToken;
+      setMetricsHydrateState(true);
+      const chunkSize = 60;
+      const chunkBudgetMs = 14;
+      const uiThrottleMs = 200;
+      let lastUiAt = 0;
+
+      return new Promise((resolve) => {
+        setTimeout(async () => {
+          if (metricsHydrationToken !== hydrateToken || !isMetricsPartial) {
+            setMetricsHydrateState(false);
+            resolve(false);
+            return;
+          }
+          try {
+            const stored = await chrome.storage.local.get(['metrics', 'metricsUpdatedAt', USERS_INDEX_STORAGE_KEY]);
+            if (metricsHydrationToken !== hydrateToken || !isMetricsPartial) {
+              setMetricsHydrateState(false);
+              resolve(false);
+              return;
+            }
+            const storedMetrics = stored.metrics || { users: {} };
+            const entries = Object.entries(storedMetrics.users || {});
+            if (!entries.length) {
+              setMetricsHydrateState(false);
+              resolve(false);
+              return;
+            }
+            const storedIndex = normalizeUsersIndex(stored[USERS_INDEX_STORAGE_KEY]);
+            if ((!Array.isArray(usersIndex) || !usersIndex.length) && storedIndex?.length) {
+              usersIndex = storedIndex;
+              const def = buildUserOptions(metrics);
+              if (!currentUserKey && def) currentUserKey = def;
+              syncUserSelectionUI();
+            }
+            const targetUsers = metrics.users || (metrics.users = {});
+            let idx = 0;
+            const tick = async () => {
+              if (metricsHydrationToken !== hydrateToken || !isMetricsPartial) {
+                setMetricsHydrateState(false);
+                resolve(false);
+                return;
+              }
+              const start = performance.now();
+              let processed = 0;
+              while (idx < entries.length) {
+                const [userKey, user] = entries[idx++];
+                targetUsers[userKey] = user;
+                processed++;
+                if (processed >= chunkSize || (performance.now() - start) >= chunkBudgetMs) break;
+              }
+              const now = performance.now();
+              if (processed && (now - lastUiAt >= uiThrottleMs || idx >= entries.length)) {
+                syncUserOptionCounts();
+                if (currentUserKey && resolveUserForKey(metrics, currentUserKey)) {
+                  refreshUserUI({ preserveEmpty: true, skipRestoreZoom: true, autoRefresh: true, skipCharts: true, skipPostListRebuild: true });
+                }
+                lastUiAt = now;
+              }
+              if (idx < entries.length) {
+                setTimeout(tick, 0);
+              } else {
+                if (stored.metricsUpdatedAt != null) {
+                  const next = Number(stored.metricsUpdatedAt);
+                  if (Number.isFinite(next)) lastMetricsUpdatedAt = next;
+                }
+                metrics.users = storedMetrics.users;
+                usersIndex = storedIndex && storedIndex.length ? storedIndex : buildUsersIndexFromMetrics(metrics);
+                isMetricsPartial = false;
+                syncUserSelectHydrateIndicator();
+                syncUserSelectionUI();
+                syncUserOptionCounts();
+                await refreshUserUI({ preserveEmpty: true, skipRestoreZoom: true, autoRefresh: true });
+                saveSessionCache();
+                setMetricsHydrateState(false);
+                resolve(true);
+              }
+            };
+            tick();
+          } catch (err) {
+            console.warn('[Dashboard] metrics hydrate failed', err);
+            setMetricsHydrateState(false);
+            resolve(false);
+          }
+        }, 0);
+      });
     }
 
     async function refreshUserUI(opts={}){
       const perfUI = perfStart('refreshUserUI total');
       try {
-        const { preserveEmpty=false, skipRestoreZoom=false, skipPostListRebuild=false, autoRefresh=false } = opts;
+        const { preserveEmpty=false, skipRestoreZoom=false, skipPostListRebuild=false, autoRefresh=false, skipCharts=false } = opts;
         const user = resolveUserForKey(metrics, currentUserKey);
         if (!user){
           updateMetricsHeader(currentUserKey, null);
@@ -6602,7 +7512,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         // No precompute needed for IR; use latest available remix count only for cards
         // Integrity check: remove posts incorrectly attributed to this user
         // Reconcile ownership (selected user only), then reclaim, then remove empty posts
-        if (!isTopTodayKey(currentUserKey) && !isMetricsPartial){
+        if (!isVirtualUserKey(currentUserKey) && !isMetricsPartial){
           const now = Date.now();
           const lastPruneAt = lastPruneAtByUser.get(currentUserKey) || 0;
           const shouldPrune = !autoRefresh || (now - lastPruneAt >= PRUNE_THROTTLE_MS);
@@ -6629,11 +7539,34 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         }
         if (currentVisibilitySource === 'showAll' || currentVisibilitySource === 'hideAll' || isPresetVisibilitySource(currentVisibilitySource)) {
           currentListActionId = currentVisibilitySource;
+        } else if (currentVisibilitySource === 'custom' || isCustomFilterAction(currentVisibilitySource)) {
+          currentListActionId = 'custom';
         }
         if (visibleSet.size) {
           for (const pid of Array.from(visibleSet)) {
             if (!Object.prototype.hasOwnProperty.call(user.posts || {}, pid)) {
               visibleSet.delete(pid);
+            }
+          }
+        }
+        if (autoRefresh) {
+          if (isCustomFilterAction(currentVisibilitySource)) {
+            const filterId = getCustomFilterId(currentVisibilitySource);
+            const f = filterId ? getCustomFiltersForUser(currentUserKey).find(it=>it.id === filterId) : null;
+            if (f) {
+              visibleSet.clear();
+              (f.ids || []).forEach(pid=>{
+                if (pid && Object.prototype.hasOwnProperty.call(user.posts||{}, pid)) visibleSet.add(pid);
+              });
+            }
+          } else if (currentVisibilitySource === 'custom') {
+            const customEntry = getCustomVisibilityEntry(currentUserKey);
+            const ids = Array.isArray(customEntry?.ids) ? customEntry.ids : [];
+            if (ids.length) {
+              visibleSet.clear();
+              ids.forEach(pid=>{
+                if (pid && Object.prototype.hasOwnProperty.call(user.posts||{}, pid)) visibleSet.add(pid);
+              });
             }
           }
         }
@@ -6680,9 +7613,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           persistVisibility();
         }
         const uiActionId = currentListActionId || currentVisibilitySource;
-        const isValidAction = uiActionId === 'showAll' || uiActionId === 'hideAll' || uiActionId === 'custom' || isPresetVisibilitySource(uiActionId);
+        const isValidAction = uiActionId === 'showAll' || uiActionId === 'hideAll' || uiActionId === 'custom' || isPresetVisibilitySource(uiActionId) || isCustomFilterAction(uiActionId);
         if (isValidAction) {
-          setListActionActive(uiActionId);
+          setListActionActive(isCustomFilterAction(uiActionId) ? 'custom' : uiActionId);
         } else {
           currentVisibilitySource = 'showAll';
           currentListActionId = 'showAll';
@@ -6701,7 +7634,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           if (currentVisibilitySource === 'custom') return 'custom';
           return null;
         })();
-        if (autoRefresh) {
+        if (autoRefresh && !(currentVisibilitySource === 'custom' || isCustomFilterAction(currentVisibilitySource))) {
           const nextSet = computeVisibleSetForAction(user, visibilityActionId);
           if (nextSet) {
             visibleSet.clear();
@@ -6724,140 +7657,143 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           perfEnd(perfList);
         }
         updateStaleButtonCount(user);
-        const perfCharts = perfStart('charts + summaries');
-        try {
-          const useUnique = viewsChartType === 'unique';
-          const series = computeSeriesForUser(user, [], colorFor, useUnique)
-            .filter(s=>visibleSet.has(s.id))
-            .map(s=>({ ...s, url: absUrl(user.posts?.[s.id]?.url, s.id) }));
-          chart.setData(series);
-          // Time chart: cumulative views by time
-          const vSeries = (function(){
-            const out=[]; for (const [pid,p] of Object.entries(user.posts||{})){
-              if (!visibleSet.has(pid)) continue; 
-              const pts=[]; 
-              for (const s of (p.snapshots||[])){ 
-                const t=s.t; 
-                const v=useUnique ? s.uv : s.views; 
-                if (t!=null && v!=null) pts.push({ x:Number(t), y:Number(v), t:Number(t) }); 
+        if (!skipCharts) {
+          const perfCharts = perfStart('charts + summaries');
+          try {
+            const useUnique = viewsChartType === 'unique';
+            const isVirtual = isVirtualUser(user);
+            const series = computeSeriesForUser(user, [], colorFor, useUnique)
+              .filter(s=>visibleSet.has(s.id))
+              .map(s=>({ ...s, url: absUrl(user.posts?.[s.id]?.url, s.id) }));
+            chart.setData(series);
+            // Time chart: cumulative views by time
+            const vSeries = (function(){
+              const out=[]; for (const [pid,p] of Object.entries(user.posts||{})){
+                if (!visibleSet.has(pid)) continue; 
+                const pts=[]; 
+                for (const s of (p.snapshots||[])){ 
+                  const t=s.t; 
+                  const v=useUnique ? s.uv : s.views; 
+                  if (t!=null && v!=null) pts.push({ x:Number(t), y:Number(v), t:Number(t) }); 
+                }
+                const color=colorFor(pid); 
+                const owner = isVirtual ? (p?.ownerHandle || '') : (user?.handle || '');
+                const label = buildPostLabel({ ...p, id: pid }, owner); 
+                if (pts.length) out.push({ id: pid, label, color, points: pts, url: absUrl(p.url, pid) }); 
               }
-              const color=colorFor(pid); 
-              const owner = user?.__specialKey === TOP_TODAY_KEY ? (p?.ownerHandle || '') : (user?.handle || '');
-              const label = buildPostLabel({ ...p, id: pid }, owner); 
-              if (pts.length) out.push({ id: pid, label, color, points: pts, url: absUrl(p.url, pid) }); 
-            }
-            return out; })();
-          viewsChart.setData(vSeries);
-          // Views Per Person chart: total views / unique views over time since post creation
-          updateViewsPerPersonChart(parseInt($('#viewsPerPersonSlider')?.value) || 1440);
-          // First 24 hours chart: views over time since post creation
-          updateFirst24HoursChart(parseInt($('#first24HoursSlider')?.value) || 1440);
-          // Only update compare charts if no compare users are selected
-          if (compareUsers.size === 0){
-            // Update unfiltered totals cards for single user
-            try {
-              const t = computeTotalsForUser(user);
-              const allTotalViewsEl = $('#allTotalViewsTotal'); if (allTotalViewsEl) allTotalViewsEl.textContent = fmt2(t.views);
-              const allUniqueViewsEl = $('#allUniqueViewsTotal'); if (allUniqueViewsEl) allUniqueViewsEl.textContent = fmt2(t.uniqueViews);
-              const allLikesEl = $('#allLikesTotal'); if (allLikesEl) allLikesEl.textContent = fmt2(t.likes);
-              const allRepliesEl = $('#allRepliesTotal'); if (allRepliesEl) allRepliesEl.textContent = fmtK2OrInt(t.replies);
-              const allRemixesEl = $('#allRemixesTotal'); if (allRemixesEl) allRemixesEl.textContent = fmt2(t.remixes);
-              const allInterEl = $('#allInteractionsTotal'); if (allInterEl) allInterEl.textContent = fmt2(t.interactions);
-              const allCameosEl = $('#allCameosTotal');
-              if (allCameosEl) {
+              return out; })();
+            viewsChart.setData(vSeries);
+            // Views Per Person chart: total views / unique views over time since post creation
+            updateViewsPerPersonChart(parseInt($('#viewsPerPersonSlider')?.value) || 1440);
+            // First 24 hours chart: views over time since post creation
+            updateFirst24HoursChart(parseInt($('#first24HoursSlider')?.value) || 1440);
+            // Only update compare charts if no compare users are selected
+            if (compareUsers.size === 0){
+              // Update unfiltered totals cards for single user
+              try {
+                const t = computeTotalsForUser(user);
+                const allTotalViewsEl = $('#allTotalViewsTotal'); if (allTotalViewsEl) allTotalViewsEl.textContent = fmt2(t.views);
+                const allUniqueViewsEl = $('#allUniqueViewsTotal'); if (allUniqueViewsEl) allUniqueViewsEl.textContent = fmt2(t.uniqueViews);
+                const allLikesEl = $('#allLikesTotal'); if (allLikesEl) allLikesEl.textContent = fmt2(t.likes);
+                const allRepliesEl = $('#allRepliesTotal'); if (allRepliesEl) allRepliesEl.textContent = fmtK2OrInt(t.replies);
+                const allRemixesEl = $('#allRemixesTotal'); if (allRemixesEl) allRemixesEl.textContent = fmt2(t.remixes);
+                const allInterEl = $('#allInteractionsTotal'); if (allInterEl) allInterEl.textContent = fmt2(t.interactions);
+                const allCameosEl = $('#allCameosTotal');
+                if (allCameosEl) {
+                  const arr = Array.isArray(user.cameos) ? user.cameos : [];
+                  const last = arr[arr.length - 1];
+                  allCameosEl.textContent = last ? fmtK2OrInt(last.count) : '0';
+                }
+                const followersEl = $('#followersTotal');
+                if (followersEl){
+                  const arr = Array.isArray(user.followers) ? user.followers : [];
+                  const last = arr[arr.length - 1];
+                  followersEl.textContent = last ? fmtK2OrInt(last.count) : '0';
+                }
+              } catch {}
+              // All posts cumulative likes (unfiltered): aggregate across all posts
+              try {
+                const ptsLikes = (function(){
+                  const events = [];
+                  for (const [pid, p] of Object.entries(user.posts||{})){
+                    for (const s of (p.snapshots||[])){
+                      const t = Number(s.t), v = Number(s.likes);
+                      if (isFinite(t) && isFinite(v)) events.push({ t, v, pid });
+                    }
+                  }
+                  events.sort((a,b)=> a.t - b.t);
+                  const latest = new Map();
+                  let total = 0;
+                  const out = [];
+                  for (const e of events){
+                    const prev = latest.get(e.pid) || 0;
+                    if (e.v !== prev){
+                      latest.set(e.pid, e.v);
+                      total += (e.v - prev);
+                      out.push({ x: e.t, y: total, t: e.t });
+                    }
+                  }
+                  return out;
+                })();
+                const colorLikes = '#ff8a7a';
+                const seriesLikes = ptsLikes.length ? [{ id: 'all_posts_likes', label: 'Likes', color: colorLikes, points: ptsLikes }] : [];
+                allLikesChart.setData(seriesLikes);
+              } catch {}
+              // All posts cumulative views (unfiltered): aggregate across all posts
+              try {
+                const useUnique = compareViewsChartType === 'unique';
+                const pts = (function(){
+                  const events = [];
+                  for (const [pid, p] of Object.entries(user.posts||{})){
+                    for (const s of (p.snapshots||[])){
+                      const t = Number(s.t);
+                      const v = useUnique ? Number(s.uv) : Number(s.views);
+                      if (isFinite(t) && isFinite(v)) events.push({ t, v, pid });
+                    }
+                  }
+                  events.sort((a,b)=> a.t - b.t);
+                  const latest = new Map();
+                  let total = 0;
+                  const out = [];
+                  for (const e of events){
+                    const prev = latest.get(e.pid) || 0;
+                    if (e.v !== prev){
+                      latest.set(e.pid, e.v);
+                      total += (e.v - prev);
+                      out.push({ x: e.t, y: total, t: e.t });
+                    }
+                  }
+                  return out;
+                })();
+                const color = '#7dc4ff';
+                const label = useUnique ? 'Viewers' : 'Total Views';
+                const series = pts.length ? [{ id: 'all_posts', label, color, points: pts }] : [];
+                const yAxisLabel = useUnique ? 'Viewers' : 'Total Views';
+                allViewsChart.setYAxisLabel(yAxisLabel);
+                allViewsChart.setData(series);
+              } catch {}
+              // Cast in chart: use user-level cast in count history when available
+              const cSeries = (function(){
                 const arr = Array.isArray(user.cameos) ? user.cameos : [];
-                const last = arr[arr.length - 1];
-                allCameosEl.textContent = last ? fmtK2OrInt(last.count) : '0';
-              }
-              const followersEl = $('#followersTotal');
-              if (followersEl){
+                const pts = arr.map(it=>({ x:Number(it.t), y:Number(it.count), t:Number(it.t) })).filter(p=>isFinite(p.x)&&isFinite(p.y));
+                const color = '#95e06c';
+                return pts.length ? [{ id: 'cameos', label: 'Cast in', color, points: pts }] : [];
+              })();
+              cameosChart.setData(cSeries);
+              // Followers chart: use user-level follower history when available
+              const fSeries = (function(){
                 const arr = Array.isArray(user.followers) ? user.followers : [];
-                const last = arr[arr.length - 1];
-                followersEl.textContent = last ? fmtK2OrInt(last.count) : '0';
-              }
-            } catch {}
-            // All posts cumulative likes (unfiltered): aggregate across all posts
-            try {
-              const ptsLikes = (function(){
-                const events = [];
-                for (const [pid, p] of Object.entries(user.posts||{})){
-                  for (const s of (p.snapshots||[])){
-                    const t = Number(s.t), v = Number(s.likes);
-                    if (isFinite(t) && isFinite(v)) events.push({ t, v, pid });
-                  }
-                }
-                events.sort((a,b)=> a.t - b.t);
-                const latest = new Map();
-                let total = 0;
-                const out = [];
-                for (const e of events){
-                  const prev = latest.get(e.pid) || 0;
-                  if (e.v !== prev){
-                    latest.set(e.pid, e.v);
-                    total += (e.v - prev);
-                    out.push({ x: e.t, y: total, t: e.t });
-                  }
-                }
-                return out;
+                const pts = arr.map(it=>({ x:Number(it.t), y:Number(it.count), t:Number(it.t) })).filter(p=>isFinite(p.x)&&isFinite(p.y));
+                const color = '#ffd166';
+                return pts.length ? [{ id: 'followers', label: 'Followers', color, points: pts }] : [];
               })();
-              const colorLikes = '#ff8a7a';
-              const seriesLikes = ptsLikes.length ? [{ id: 'all_posts_likes', label: 'Likes', color: colorLikes, points: ptsLikes }] : [];
-              allLikesChart.setData(seriesLikes);
-            } catch {}
-            // All posts cumulative views (unfiltered): aggregate across all posts
-            try {
-              const useUnique = compareViewsChartType === 'unique';
-              const pts = (function(){
-                const events = [];
-                for (const [pid, p] of Object.entries(user.posts||{})){
-                  for (const s of (p.snapshots||[])){
-                    const t = Number(s.t);
-                    const v = useUnique ? Number(s.uv) : Number(s.views);
-                    if (isFinite(t) && isFinite(v)) events.push({ t, v, pid });
-                  }
-                }
-                events.sort((a,b)=> a.t - b.t);
-                const latest = new Map();
-                let total = 0;
-                const out = [];
-                for (const e of events){
-                  const prev = latest.get(e.pid) || 0;
-                  if (e.v !== prev){
-                    latest.set(e.pid, e.v);
-                    total += (e.v - prev);
-                    out.push({ x: e.t, y: total, t: e.t });
-                  }
-                }
-                return out;
-              })();
-              const color = '#7dc4ff';
-              const label = useUnique ? 'Viewers' : 'Total Views';
-              const series = pts.length ? [{ id: 'all_posts', label, color, points: pts }] : [];
-              const yAxisLabel = useUnique ? 'Viewers' : 'Total Views';
-              allViewsChart.setYAxisLabel(yAxisLabel);
-              allViewsChart.setData(series);
-            } catch {}
-            // Cast in chart: use user-level cast in count history when available
-            const cSeries = (function(){
-              const arr = Array.isArray(user.cameos) ? user.cameos : [];
-              const pts = arr.map(it=>({ x:Number(it.t), y:Number(it.count), t:Number(it.t) })).filter(p=>isFinite(p.x)&&isFinite(p.y));
-              const color = '#95e06c';
-              return pts.length ? [{ id: 'cameos', label: 'Cast in', color, points: pts }] : [];
-            })();
-            cameosChart.setData(cSeries);
-            // Followers chart: use user-level follower history when available
-            const fSeries = (function(){
-              const arr = Array.isArray(user.followers) ? user.followers : [];
-              const pts = arr.map(it=>({ x:Number(it.t), y:Number(it.count), t:Number(it.t) })).filter(p=>isFinite(p.x)&&isFinite(p.y));
-              const color = '#ffd166';
-              return pts.length ? [{ id: 'followers', label: 'Followers', color, points: pts }] : [];
-            })();
-            followersChart.setData(fSeries);
-          } else {
-            updateCompareCharts();
+              followersChart.setData(fSeries);
+            } else {
+              updateCompareCharts();
+            }
+          } finally {
+            perfEnd(perfCharts);
           }
-        } finally {
-          perfEnd(perfCharts);
         }
       // Restore any saved zoom for this user (unless skipRestoreZoom is true)
       if (!skipRestoreZoom) {
@@ -6921,7 +7857,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (postsWrap) {
         postsWrap._sctOnToggle = (pid, row, btn)=>{
           if (!user || !user.posts || !pid) return;
-          const isCustomMode = currentVisibilitySource === 'custom' || isCustomFilterAction(currentVisibilitySource) || currentListActionId === 'custom' || listOpts?.activeActionId === 'custom';
+          const isVirtual = isVirtualUser(user);
+          let isCustomMode = currentVisibilitySource === 'custom' || isCustomFilterAction(currentVisibilitySource) || currentListActionId === 'custom' || listOpts?.activeActionId === 'custom';
+          const shouldAutoCustom = !isCustomMode && isCoreVisibilitySource(currentVisibilitySource);
           if (isCustomMode) {
             if (currentVisibilitySource !== 'custom' && !isCustomFilterAction(currentVisibilitySource)) {
               currentVisibilitySource = 'custom';
@@ -6938,6 +7876,16 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             if (row) row.classList.remove('hidden');
             if (btn) btn.textContent = 'Hide';
           }
+          if (shouldAutoCustom) {
+            const autoId = createAutoCustomFilterForUser(currentUserKey, visibleSet);
+            if (autoId) {
+              currentVisibilitySource = `${CUSTOM_FILTER_PREFIX}${autoId}`;
+              setListActionActive('custom');
+              renderCustomFilters(currentUserKey);
+              setCustomFilterActive(autoId);
+              isCustomMode = true;
+            }
+          }
           const nextOpts = listOpts || {};
           if (isCustomMode) nextOpts.activeActionId = 'custom';
           updatePostsListRows(user, colorFor, visibleSet, nextOpts);
@@ -6953,7 +7901,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
               for (const s of (p.snapshots||[])){
                 const t=s.t; const v=useUnique ? s.uv : s.views; if (t!=null && v!=null) pts.push({ x:Number(t), y:Number(v), t:Number(t) });
               }
-              const owner = user?.__specialKey === TOP_TODAY_KEY ? (p?.ownerHandle || '') : (user?.handle || '');
+              const owner = isVirtual ? (p?.ownerHandle || '') : (user?.handle || '');
               const color=colorFor(vpid); const label=buildPostLabel({ ...p, id: vpid }, owner); if (pts.length) out.push({ id: vpid, label, color, points: pts, url: absUrl(p.url, vpid) });
             }
             return out; })();
@@ -7024,11 +7972,54 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         delete searchInput.dataset.selectedKey;
         delete searchInput.dataset.selectedLabel;
       }
+      updateUserSelectHydrateIndicatorPosition();
+    }
+
+    function syncUserOptionCount(userKey, count){
+      if (!userKey) return;
+      const selEl = $('#userSelect');
+      const entry = findUserIndexEntry(userKey);
+      if (entry) entry.postCount = count;
+      if (selEl) {
+        for (const opt of Array.from(selEl.options || [])){
+          if (opt.value !== userKey) continue;
+          const user = metrics?.users?.[userKey];
+          const name = entry?.handle || user?.handle || userKey;
+          opt.textContent = formatUserOptionLabel(name, count);
+          break;
+        }
+      }
+      if (currentUserKey === userKey) syncUserSelectionUI();
+    }
+
+    function syncUserOptionCounts(){
+      const selEl = $('#userSelect');
+      if (!selEl) return;
+      let topToday = null;
+      const useIndex = Array.isArray(usersIndex) && usersIndex.length > 0;
+      const indexByKey = useIndex ? new Map(usersIndex.map((entry)=>[entry.key, entry])) : null;
+      for (const opt of Array.from(selEl.options || [])){
+        const key = opt.value;
+        if (!key) continue;
+        if (key === TOP_TODAY_KEY) {
+          if (isMetricsPartial) continue;
+          topToday = topToday || buildTopTodayUser(metrics);
+          const count = Object.keys(topToday.posts || {}).length;
+          opt.textContent = formatUserOptionLabel(topToday.handle, count);
+          continue;
+        }
+        const entry = indexByKey ? indexByKey.get(key) : null;
+        const user = metrics?.users?.[key];
+        const name = entry?.handle || user?.handle || key;
+        const count = entry ? (Number(entry.postCount) || 0) : Object.keys(user?.posts || {}).length;
+        opt.textContent = formatUserOptionLabel(name, count);
+      }
+      syncUserSelectionUI();
     }
 
     function reconcileCompareUsers(){
       for (const key of Array.from(compareUsers)){
-        if (!(metrics.users[key] || isTopTodayKey(key))) compareUsers.delete(key);
+        if (!(metrics.users[key] || isVirtualUserKey(key))) compareUsers.delete(key);
       }
       const hasCurrent = currentUserKey && resolveUserForKey(metrics, currentUserKey);
       if (compareUsers.size === 1 && hasCurrent){
@@ -7040,18 +8031,31 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       renderComparePills();
     }
 
-    async function switchUserSelection(nextUserKey){
-      if (isMetricsPartial && nextUserKey && (isTopTodayKey(nextUserKey) || !metrics.users?.[nextUserKey])) {
+    async function switchUserSelection(nextUserKey, opts = {}){
+      const forceCache = !!opts.forceCache;
+      const useStoredFilter = !!opts.useStoredFilter;
+      const keepCurrentFilter = !!opts.keepCurrentFilter;
+      postHydrationToken++;
+      setPostsHydrateState(false);
+      if (isMetricsPartial && nextUserKey && (isVirtualUserKey(nextUserKey) || !metrics.users?.[nextUserKey])) {
         await refreshData({ skipPostListRebuild: false, skipRestoreZoom: true });
       }
-      const nextAction = normalizeFilterAction(currentVisibilitySource) || normalizeFilterAction(currentListActionId) || getSessionFilterAction();
+      const currentAction = normalizeFilterAction(currentVisibilitySource)
+        || normalizeFilterAction(currentListActionId)
+        || getSessionFilterAction(currentUserKey);
+      const safeCurrentAction = (currentAction === 'custom' || isCustomFilterAction(currentAction)) ? 'showAll' : currentAction;
+      const storedAction = useStoredFilter ? getSavedFilterActionForUser(nextUserKey) : null;
+      const nextAction = keepCurrentFilter
+        ? (safeCurrentAction || 'showAll')
+        : (storedAction || safeCurrentAction || getSessionFilterAction(nextUserKey));
       currentUserKey = nextUserKey;
+      trackLastSelectedUserKey();
       visibleSet.clear();
       currentVisibilitySource = null;
       currentListActionId = null;
 
       const def = buildUserOptions(metrics);
-      if (!(metrics.users[currentUserKey] || isTopTodayKey(currentUserKey))) currentUserKey = def;
+      if (!(metrics.users[currentUserKey] || isVirtualUserKey(currentUserKey))) currentUserKey = def;
       syncUserSelectionUI();
       try { await chrome.storage.local.set({ lastUserKey: currentUserKey }); } catch {}
       updateBestTimeToPostSection();
@@ -7060,23 +8064,23 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
 
       const u = resolveUserForKey(metrics, currentUserKey);
       if (u) {
-        setListActionActive(normalizeFilterAction(nextAction) || getSessionFilterAction() || 'showAll');
+        setListActionActive(normalizeFilterAction(nextAction) || getSessionFilterAction(nextUserKey) || 'showAll');
         const didClick = triggerFilterClick(nextAction);
         if (!didClick) {
           applyUserFilterState(currentUserKey, u, nextAction);
           await refreshUserUI({ preserveEmpty: true });
           persistVisibility();
         }
-        saveSessionCache();
+        saveSessionCache({ force: forceCache });
         return;
       }
       await refreshUserUI({ preserveEmpty: true });
       persistVisibility();
-      saveSessionCache();
+      saveSessionCache({ force: forceCache });
     }
 
     $('#userSelect').addEventListener('change', async (e)=>{
-      await switchUserSelection(e.target.value);
+      await switchUserSelection(e.target.value, { forceCache: true, keepCurrentFilter: true });
     });
 
     // Views type toggle pills
@@ -7091,6 +8095,13 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (allOverTimeTitle) allOverTimeTitle.textContent = `${prefix} over Time`;
     }
 
+    function syncViewsPills(type){
+      const uniquePill = $('#uniqueViewsPill');
+      const totalPill = $('#totalViewsPill');
+      if (uniquePill) uniquePill.classList.toggle('active', type === 'unique');
+      if (totalPill) totalPill.classList.toggle('active', type !== 'unique');
+    }
+
     function updateViewsType(type){
       // Prevent accidental calls or recursive updates
       if (isUpdatingViewsType || viewsChartType === type) return;
@@ -7099,33 +8110,25 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       try {
         viewsChartType = type;
         compareViewsChartType = type;
-        const uniquePill = $('#uniqueViewsPill');
-        const totalPill = $('#totalViewsPill');
-        if (uniquePill && totalPill) {
-          if (type === 'unique') {
-            uniquePill.classList.add('active');
-            totalPill.classList.remove('active');
-          } else {
-            uniquePill.classList.remove('active');
-            totalPill.classList.add('active');
-          }
-        }
-      // Update chart labels
-      const yAxisLabel = type === 'unique' ? 'Viewers' : 'Total Views';
-      const xAxisLabel = type === 'unique' ? 'Viewers' : 'Total Views';
-      const tooltipLabel = type === 'unique' ? 'Viewers' : 'Total Views';
-      
-      chart.setAxisLabels(xAxisLabel, tooltipLabel);
-      viewsChart.setYAxisLabel(yAxisLabel);
-      first24HoursChart.setYAxisLabel(yAxisLabel);
-      syncViewsHeaders(type);
-      
-      // Immediately clear data to prevent hovering over stale data from wrong mode
-      chart.setData([]);
-      viewsChart.setData([]);
-      first24HoursChart.setData([]);
-      
-      // Refresh the UI to update chart data
+        saveViewsChartType(type);
+        viewsChartTypeLoaded = true;
+        syncViewsPills(type);
+        // Update chart labels
+        const yAxisLabel = type === 'unique' ? 'Viewers' : 'Total Views';
+        const xAxisLabel = type === 'unique' ? 'Viewers' : 'Total Views';
+        const tooltipLabel = type === 'unique' ? 'Viewers' : 'Total Views';
+        
+        chart.setAxisLabels(xAxisLabel, tooltipLabel);
+        viewsChart.setYAxisLabel(yAxisLabel);
+        first24HoursChart.setYAxisLabel(yAxisLabel);
+        syncViewsHeaders(type);
+        
+        // Immediately clear data to prevent hovering over stale data from wrong mode
+        chart.setData([]);
+        viewsChart.setData([]);
+        first24HoursChart.setData([]);
+        
+        // Refresh the UI to update chart data
         refreshUserUI({ skipRestoreZoom: true });
       } finally {
         isUpdatingViewsType = false;
@@ -7141,6 +8144,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (viewsChartType !== 'total') updateViewsType('total');
     });
     syncViewsHeaders(viewsChartType);
+    syncViewsPills(viewsChartType);
 
 
     // Typeahead suggestions
@@ -7160,7 +8164,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       $$('.item', suggestions).forEach(it=>{
         it.addEventListener('click', async ()=>{
           suggestions.style.display='none';
-          await switchUserSelection(it.dataset.key);
+          await switchUserSelection(it.dataset.key, { forceCache: true, keepCurrentFilter: true });
         });
       });
     }
@@ -7192,6 +8196,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     if (searchInput) {
       searchInput.addEventListener('input', (e)=>{
         renderUserSuggestions(e.target.value);
+        updateUserSelectHydrateIndicatorPosition();
       });
       searchInput.addEventListener('focus', ()=>{
         showUserSuggestions();
@@ -7200,6 +8205,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       searchInput.addEventListener('click', ()=>{
         showUserSuggestions();
         maybeSelectSearchText();
+      });
+      window.addEventListener('resize', ()=>{
+        updateUserSelectHydrateIndicatorPosition();
       });
     }
     document.addEventListener('click', (e)=>{
@@ -7268,10 +8276,15 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     const postPurgeConfirmYes = $('#postPurgeConfirmYes');
     const postPurgeConfirmNo = $('#postPurgeConfirmNo');
     
+    function setPurgeConfirmOpen(isOpen){
+      document.body.classList.toggle('is-purge-confirm-open', isOpen);
+    }
+
     function showPostPurgeConfirm(snippet, pid){
       pendingPostPurge = { pid, userKey: currentUserKey, caption: snippet };
       if (postPurgeConfirmText) postPurgeConfirmText.textContent = `Are you sure you want to purge data tied to "${snippet}"?`;
       if (postPurgeConfirmDialog){
+        setPurgeConfirmOpen(true);
         postPurgeConfirmDialog.style.display = 'flex';
       } else {
         alert(`Are you sure you want to purge data tied to "${snippet}"?`);
@@ -7325,6 +8338,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     function closePurgeModal(opts = {}){
       if (purgeModal) purgeModal.style.display = 'none';
       if (purgeConfirmDialog) purgeConfirmDialog.style.display = 'none';
+      setPurgeConfirmOpen(false);
       const shouldRunComb = opts.runCombOnClose && combModeCheckedThisSession && combModeEnabled;
       combModeCheckedThisSession = false;
       if (shouldRunComb) {
@@ -7725,6 +8739,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     $('#purgeExecute').addEventListener('click', ()=>{
       const description = getPurgeDescription();
       purgeConfirmText.textContent = `Are you sure you want to purge ${description}?`;
+      setPurgeConfirmOpen(true);
       purgeConfirmDialog.style.display = 'flex';
     });
     const purgeExportBtn = $('#purgeExport');
@@ -7736,24 +8751,41 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
 
     $('#purgeConfirmNo').addEventListener('click', ()=>{
       purgeConfirmDialog.style.display = 'none';
+      setPurgeConfirmOpen(false);
     });
 
-    $('#purgeConfirmYes').addEventListener('click', async ()=>{
-      // Set purge lock to prevent concurrent writes from content script
-      await chrome.storage.local.set({ purgeLock: Date.now() });
+    function setPurgeSidebarHidden(hidden){
+      document.body.classList.toggle('is-purging', hidden);
+    }
 
-      const days = Number(dateRangeSlider.value);
-      const minPosts = Number(postCountSlider.value);
-      const minFollowers = Number(followerCountSlider.value);
-      
-      const cutoffTime = Date.now() - (days * 24 * 60 * 60 * 1000);
-      
+    function scheduleAfterPaint(fn){
+      requestAnimationFrame(() => {
+        requestAnimationFrame(fn);
+      });
+    }
+
+    function scheduleIdle(fn){
+      if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(fn, { timeout: 1000 });
+      } else {
+        setTimeout(fn, 0);
+      }
+    }
+
+    function applyPurgeToMetrics(targetMetrics, opts){
+      const days = Number(opts.days);
+      const minPosts = Number(opts.minPosts);
+      const minFollowers = Number(opts.minFollowers);
+      const cutoffTime = Number(opts.cutoffTime);
+      let purgedUsers = 0;
+      let purgedPosts = 0;
+
       // Helper to get post time with snapshot fallback for purge
       function getPostTimeForPurge(post) {
         // First try explicit post time fields
         let t = getPostTimeStrict(post);
         if (t > 0) return t;
-        
+
         // Fallback: use the earliest snapshot timestamp
         if (Array.isArray(post.snapshots) && post.snapshots.length > 0) {
           const times = post.snapshots.map(s => s.t || 0).filter(t => t > 0);
@@ -7761,123 +8793,139 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             return Math.min(...times); // Return earliest snapshot time
           }
         }
-        
+
         // No timestamp available
         return 0;
       }
-      
-      try {
-        metrics = await loadMetrics();
-        let purgedUsers = 0;
-        let purgedPosts = 0;
-        
-        
-        // Process each user
-        for (const [userKey, user] of Object.entries(metrics.users || {})){
-          // Skip excepted users
-          if (exceptedUsers.has(userKey)) continue;
-          
-          // Ensure posts object exists
-          if (!user.posts) user.posts = {};
-          
-          // Get follower count for later use
-          const followersArr = Array.isArray(user.followers) ? user.followers : [];
-          const latestFollowers = followersArr.length > 0 ? Number(followersArr[followersArr.length - 1]?.count) : 0;
-          
-          // ALWAYS purge posts by date first (if days is set and <= 365)
-          // This ensures all old posts are removed regardless of minPosts/minFollowers settings
-          let postsToKeep = {};
-          const originalPostCount = Object.keys(user.posts || {}).length;
-          if (days <= 365) {
-            // Purge posts older than cutoff time
-            for (const [pid, post] of Object.entries(user.posts || {})){
-              const postTime = getPostTimeForPurge(post);
-              // Keep posts that have a timestamp AND are within the cutoff time
-              // Posts without timestamps are purged (considered old/unknown)
-              if (postTime > 0 && postTime >= cutoffTime){
-                postsToKeep[pid] = post;
-              } else {
-                purgedPosts++;
-              }
+
+      // Process each user
+      for (const [userKey, user] of Object.entries(targetMetrics.users || {})){
+        // Skip excepted users
+        if (exceptedUsers.has(userKey)) continue;
+
+        // Ensure posts object exists
+        if (!user.posts) user.posts = {};
+
+        // Get follower count for later use
+        const followersArr = Array.isArray(user.followers) ? user.followers : [];
+        const latestFollowers = followersArr.length > 0 ? Number(followersArr[followersArr.length - 1]?.count) : 0;
+
+        // ALWAYS purge posts by date first (if days is set and <= 365)
+        // This ensures all old posts are removed regardless of minPosts/minFollowers settings
+        let postsToKeep = {};
+        const originalPostCount = Object.keys(user.posts || {}).length;
+        if (days <= 365) {
+          // Purge posts older than cutoff time
+          for (const [pid, post] of Object.entries(user.posts || {})){
+            const postTime = getPostTimeForPurge(post);
+            // Keep posts that have a timestamp AND are within the cutoff time
+            // Posts without timestamps are purged (considered old/unknown)
+            if (postTime > 0 && postTime >= cutoffTime){
+              postsToKeep[pid] = post;
+            } else {
+              purgedPosts++;
             }
-            const purgedCount = originalPostCount - Object.keys(postsToKeep).length;
-            if (purgedCount > 0) {
-            }
-          } else {
-            // If days > 365, keep all posts (no date-based purging)
-            postsToKeep = { ...user.posts };
           }
-          
-          // Update user's posts with purged list
-          user.posts = postsToKeep;
-          
-          // Now check if user should be kept based on minPosts/minFollowers criteria
-          const postCountAfterPurge = Object.keys(postsToKeep).length;
-          
-          // ALWAYS remove users with no posts left after purge, regardless of other criteria
-          if (postCountAfterPurge === 0) {
-            delete metrics.users[userKey];
-            purgedUsers++;
-            continue;
+          const purgedCount = originalPostCount - Object.keys(postsToKeep).length;
+          if (purgedCount > 0) {
           }
-          
-          const hasLowFollowers = minFollowers > 0 && (!isFinite(latestFollowers) || latestFollowers < minFollowers);
-          const hasLowPosts = minPosts > 0 && (minPosts === 1 ? postCountAfterPurge <= minPosts : postCountAfterPurge < minPosts);
-          
-          // Determine if user should be removed based on minPosts/minFollowers criteria:
-          // - If both minPosts and minFollowers are set: user must meet BOTH to be removed
-          // - If only one is set: user must meet that one to be removed
-          // - If neither is set: keep the user (they have posts, so they're kept)
-          let shouldRemoveUser = false;
-          if (minPosts > 0 && minFollowers > 0) {
-            shouldRemoveUser = hasLowPosts && hasLowFollowers;
-          } else if (minPosts > 0) {
-            shouldRemoveUser = hasLowPosts;
-          } else if (minFollowers > 0) {
-            shouldRemoveUser = hasLowFollowers;
-          }
-          // else: no criteria set, keep user since they have posts
-          
-          // Remove user if they should be purged
-          if (shouldRemoveUser){
-            delete metrics.users[userKey];
-            purgedUsers++;
-          }
+        } else {
+          // If days > 365, keep all posts (no date-based purging)
+          postsToKeep = { ...user.posts };
         }
-        
-        
-        // Save purged metrics
-        await saveMetrics(metrics, { userKeys: Object.keys(metrics.users || {}) });
-        
-        // Refresh UI
-        metrics = await loadMetrics();
-        const prev = currentUserKey;
-        const def = buildUserOptions(metrics);
-        if (!(metrics.users[prev] || isTopTodayKey(prev))) currentUserKey = def;
-        syncUserSelectionUI();
-        
-        // Clean up compare users that no longer exist
-        for (const key of Array.from(compareUsers)){
-          if (!(metrics.users[key] || isTopTodayKey(key))) compareUsers.delete(key);
+
+        // Update user's posts with purged list
+        user.posts = postsToKeep;
+
+        // Now check if user should be kept based on minPosts/minFollowers criteria
+        const postCountAfterPurge = Object.keys(postsToKeep).length;
+
+        // ALWAYS remove users with no posts left after purge, regardless of other criteria
+        if (postCountAfterPurge === 0) {
+          delete targetMetrics.users[userKey];
+          purgedUsers++;
+          continue;
         }
-        renderComparePills();
-        refreshUserUI();
-        updateBestTimeToPostSection();
-        
-        // Close modals
-        closePurgeModal({ runCombOnClose: true });
-        
-        // Update storage size display
-        await updateStorageSizeDisplay();
-        
-        // Show success message
-        alert(`Purge complete!\n\nRemoved ${purgedUsers} user(s) and ${purgedPosts} post(s).`);
-      } catch (e) {
-        console.error('[Dashboard] Purge failed', e);
-        alert('Purge failed. Please check the console for details.');
-      } finally {
-        await chrome.storage.local.remove('purgeLock');
+
+        const hasLowFollowers = minFollowers > 0 && (!isFinite(latestFollowers) || latestFollowers < minFollowers);
+        const hasLowPosts = minPosts > 0 && (minPosts === 1 ? postCountAfterPurge <= minPosts : postCountAfterPurge < minPosts);
+
+        // Determine if user should be removed based on minPosts/minFollowers criteria:
+        // - If both minPosts and minFollowers are set: user must meet BOTH to be removed
+        // - If only one is set: user must meet that one to be removed
+        // - If neither is set: keep the user (they have posts, so they're kept)
+        let shouldRemoveUser = false;
+        if (minPosts > 0 && minFollowers > 0) {
+          shouldRemoveUser = hasLowPosts && hasLowFollowers;
+        } else if (minPosts > 0) {
+          shouldRemoveUser = hasLowPosts;
+        } else if (minFollowers > 0) {
+          shouldRemoveUser = hasLowFollowers;
+        }
+        // else: no criteria set, keep user since they have posts
+
+        // Remove user if they should be purged
+        if (shouldRemoveUser){
+          delete targetMetrics.users[userKey];
+          purgedUsers++;
+        }
       }
+
+      return { purgedUsers, purgedPosts };
+    }
+
+    $('#purgeConfirmYes').addEventListener('click', async ()=>{
+      closePurgeModal({ runCombOnClose: true });
+      setPurgeSidebarHidden(true);
+      // Set purge lock to prevent concurrent writes from content script
+      const purgeLockPromise = chrome.storage.local.set({ purgeLock: Date.now() });
+
+      const days = Number(dateRangeSlider.value);
+      const minPosts = Number(postCountSlider.value);
+      const minFollowers = Number(followerCountSlider.value);
+      
+      const cutoffTime = Date.now() - (days * 24 * 60 * 60 * 1000);
+      const purgeOpts = { days, minPosts, minFollowers, cutoffTime };
+      
+      scheduleAfterPaint(() => {
+        scheduleIdle(() => {
+          try {
+            applyPurgeToMetrics(metrics, purgeOpts);
+            const prev = currentUserKey;
+            const def = buildUserOptions(metrics);
+            if (!(metrics.users[prev] || isVirtualUserKey(prev))) currentUserKey = def;
+            syncUserSelectionUI();
+
+            // Clean up compare users that no longer exist
+            for (const key of Array.from(compareUsers)){
+              if (!(metrics.users[key] || isVirtualUserKey(key))) compareUsers.delete(key);
+            }
+            renderComparePills();
+            refreshUserUI();
+            updateBestTimeToPostSection();
+          } catch (e) {
+            console.error('[Dashboard] Optimistic purge failed', e);
+          } finally {
+            setPurgeSidebarHidden(false);
+          }
+        });
+      });
+
+      setTimeout(async () => {
+        try {
+          await purgeLockPromise;
+          const loadedMetrics = await loadMetrics();
+          const { purgedUsers, purgedPosts } = applyPurgeToMetrics(loadedMetrics, purgeOpts);
+          await saveMetrics(loadedMetrics, { userKeys: Object.keys(loadedMetrics.users || {}) });
+          await updateStorageSizeDisplay();
+          alert(`Purge complete!\n\nRemoved ${purgedUsers} user(s) and ${purgedPosts} post(s).`);
+        } catch (e) {
+          console.error('[Dashboard] Purge failed', e);
+          alert('Purge failed. Please check the console for details.');
+        } finally {
+          await chrome.storage.local.remove('purgeLock');
+        }
+      }, 0);
     });
 
     // Per-post purge confirmation handlers
@@ -7885,7 +8933,45 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       postPurgeConfirmNo.addEventListener('click', ()=>{
         pendingPostPurge = null;
         if (postPurgeConfirmDialog) postPurgeConfirmDialog.style.display = 'none';
+        setPurgeConfirmOpen(false);
       });
+    }
+
+    function removePostFromMetrics(targetMetrics, pid){
+      const users = targetMetrics?.users || {};
+      let removedAny = false;
+      const affectedKeys = new Set();
+      for (const [uKey, user] of Object.entries(users)){
+        if (!user?.posts || !user.posts[pid]) continue;
+        delete user.posts[pid];
+        removedAny = true;
+        affectedKeys.add(uKey);
+        if (Object.keys(user.posts).length === 0){
+          delete users[uKey];
+        }
+      }
+      return { removedAny, affectedKeys };
+    }
+
+    function applyPostPurgeToUI(pid){
+      const { removedAny } = removePostFromMetrics(metrics, pid);
+      if (!removedAny) return false;
+      const safePid = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(pid) : String(pid).replace(/"/g, '\\"');
+      const row = document.querySelector(`.post[data-pid="${safePid}"]`);
+      if (row) row.remove();
+      visibleSet.delete(pid);
+      const prev = currentUserKey;
+      const def = buildUserOptions(metrics);
+      if (!(metrics.users[prev] || isVirtualUserKey(prev))) currentUserKey = def;
+      syncUserSelectionUI();
+      for (const key of Array.from(compareUsers)){
+        if (!(metrics.users[key] || isVirtualUserKey(key))) compareUsers.delete(key);
+      }
+      renderComparePills();
+      refreshUserUI({ preserveEmpty: true });
+      persistVisibility();
+      updateBestTimeToPostSection();
+      return true;
     }
 
     if (postPurgeConfirmYes) {
@@ -7896,48 +8982,33 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         }
         const { pid } = pendingPostPurge;
         pendingPostPurge = null;
+        if (postPurgeConfirmDialog) postPurgeConfirmDialog.style.display = 'none';
+        setPurgeConfirmOpen(false);
+        applyPostPurgeToUI(pid);
         await chrome.storage.local.set({ purgeLock: Date.now() });
         try {
-          metrics = await loadMetrics();
-          const users = metrics?.users || {};
-          let removedAny = false;
-          const affectedKeys = new Set();
-          for (const [uKey, user] of Object.entries(users)){
-            if (!user?.posts || !user.posts[pid]) continue;
-            delete user.posts[pid];
-            removedAny = true;
-            affectedKeys.add(uKey);
-            if (Object.keys(user.posts).length === 0){
-              delete users[uKey];
-            }
-          }
-          if (removedAny) {
-            await saveMetrics(metrics, { userKeys: Array.from(affectedKeys) });
-            visibleSet.delete(pid);
-            const prev = currentUserKey;
-            const def = buildUserOptions(metrics);
-            if (!(metrics.users[prev] || isTopTodayKey(prev))) currentUserKey = def;
-            syncUserSelectionUI();
-            for (const key of Array.from(compareUsers)){
-              if (!(metrics.users[key] || isTopTodayKey(key))) compareUsers.delete(key);
-            }
-            renderComparePills();
-            refreshUserUI({ preserveEmpty: true });
-            persistVisibility();
-            updateBestTimeToPostSection();
-          }
+          const loadedMetrics = await loadMetrics();
+          const { removedAny, affectedKeys } = removePostFromMetrics(loadedMetrics, pid);
+          if (removedAny) await saveMetrics(loadedMetrics, { userKeys: Array.from(affectedKeys) });
         } catch (e) {
           console.error('[Dashboard] Post purge failed', e);
           alert('Failed to purge this post. Please try again.');
+          try {
+            metrics = await loadMetrics();
+            refreshUserUI({ preserveEmpty: true });
+          } catch {}
         } finally {
           await chrome.storage.local.remove('purgeLock');
-          if (postPurgeConfirmDialog) postPurgeConfirmDialog.style.display = 'none';
         }
       });
     }
 
     const refreshData = async (opts = {}) => {
       const perfRefresh = perfStart('refreshData total');
+      metricsHydrationToken++;
+      setMetricsHydrateState(false);
+      postHydrationToken++;
+      setPostsHydrateState(false);
       const isAutoRefresh = !!opts.autoRefresh;
       const skipRestoreZoom = !!opts.skipRestoreZoom || isAutoRefresh;
       const userSelect = $('#userSelect');
@@ -7956,6 +9027,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         const nextUpdatedAt = await getMetricsUpdatedAt();
         perfEnd(perfMeta);
       if (!isMetricsPartial && nextUpdatedAt && lastMetricsUpdatedAt && nextUpdatedAt === lastMetricsUpdatedAt) {
+        const user = resolveUserForKey(metrics, currentUserKey);
+        updateStaleButtonCount(user);
         perfEnd(perfRefresh);
         perfFlush('auto refresh', PERF_AUTO_ENABLED);
         return;
@@ -7972,19 +9045,21 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       const perfLoad = perfStart('load metrics');
       metrics = await loadMetrics();
       isMetricsPartial = false;
+      syncUserSelectHydrateIndicator();
       perfEnd(perfLoad);
       if (!isAutoRefresh) {
         const prev = currentUserKey; const def = buildUserOptions(metrics);
-        if (!(metrics.users[prev] || isTopTodayKey(prev))) currentUserKey = def;
+        if (!(metrics.users[prev] || isVirtualUserKey(prev))) currentUserKey = def;
         syncUserSelectionUI();
       } else if (userSelect && userSelectScrollTop != null) {
         userSelect.scrollTop = userSelectScrollTop;
       }
+      syncUserOptionCounts();
       try { await chrome.storage.local.set({ lastUserKey: currentUserKey }); } catch {}
       
       // Clean up compare users that no longer exist
       for (const key of Array.from(compareUsers)){
-        if (!(metrics.users[key] || isTopTodayKey(key))) compareUsers.delete(key);
+        if (!(metrics.users[key] || isVirtualUserKey(key))) compareUsers.delete(key);
       }
       renderComparePills();
       renderCustomFilters(currentUserKey);
@@ -8069,6 +9144,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         const wrap = document.querySelector('.list-actions');
         if (!wrap) return;
         wrap.querySelectorAll('button').forEach(btn=>{
+          if (btn.classList.contains('custom-filter-btn')) return;
           if (btn.id === activeId) btn.classList.add('active');
           else btn.classList.remove('active');
         });
@@ -8076,46 +9152,90 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (activeId !== 'custom') setCustomFilterActive(null);
     }
 
+      function setupFilterTooltips(){
+        const tooltipCopy = {
+          showAll: 'Show all posts',
+          hideAll: 'Hide all posts',
+          pastDay: 'Only posts from the last 24 hours',
+          pastWeek: 'Only posts from the last 7 days',
+          last5: 'Most recent five posts',
+          last10: 'Most recent ten posts',
+          top5: 'Five most-liked posts',
+          top10: 'Ten most-liked posts',
+          bottom5: 'Five least-liked posts outside last 24 hours',
+          bottom10: 'Ten least-liked posts outside last 24 hours',
+          stale: 'Posts missing data from last 24 hours'
+        };
+        let tooltipTimer = null;
+        let tooltipEl = null;
+        let lastMouse = null;
+        const hideTooltip = ()=>{
+          if (tooltipTimer) {
+            clearTimeout(tooltipTimer);
+            tooltipTimer = null;
+          }
+          if (tooltipEl) tooltipEl.style.display = 'none';
+        };
+        const showTooltip = (target, text, clientX, clientY)=>{
+          if (!target || !text) return;
+          if (!tooltipEl) {
+            tooltipEl = document.createElement('div');
+            tooltipEl.className = 'tooltip custom-filter-tooltip';
+            document.body.appendChild(tooltipEl);
+          }
+          tooltipEl.textContent = text;
+          tooltipEl.style.display = 'block';
+          const width = tooltipEl.offsetWidth || 0;
+          const left = Math.max(8, Math.min(window.innerWidth - width - 8, clientX - width / 2));
+          tooltipEl.style.left = left + 'px';
+          tooltipEl.style.top = (clientY + 8) + 'px';
+        };
+        Object.entries(tooltipCopy).forEach(([id, text])=>{
+          const btn = document.getElementById(id);
+          if (!btn || btn.dataset.tooltipBound === '1') return;
+          btn.dataset.tooltipBound = '1';
+          btn.addEventListener('mouseenter', (e)=>{
+            if (tooltipTimer) clearTimeout(tooltipTimer);
+            lastMouse = { x: e.clientX, y: e.clientY };
+            tooltipTimer = setTimeout(()=>{
+              const point = lastMouse || btn.getBoundingClientRect();
+              const x = lastMouse ? lastMouse.x : (point.left + point.width / 2);
+              const y = lastMouse ? lastMouse.y : point.bottom;
+              showTooltip(btn, text, x, y);
+            }, 500);
+          });
+          btn.addEventListener('mousemove', (e)=>{
+            lastMouse = { x: e.clientX, y: e.clientY };
+            if (tooltipEl && tooltipEl.style.display === 'block') {
+              showTooltip(btn, text, e.clientX, e.clientY);
+            }
+          });
+          btn.addEventListener('mouseleave', hideTooltip);
+          btn.addEventListener('blur', hideTooltip);
+        });
+      }
+
+      setupFilterTooltips();
+
       $('#showAll').addEventListener('click', ()=>{
-        const activeCustomId = getCustomFilterId(currentVisibilitySource);
         currentVisibilitySource = 'showAll';
         setListActionActive('showAll');
         const u = resolveUserForKey(metrics, currentUserKey);
         if (!u) return;
         visibleSet.clear();
         Object.keys(u.posts||{}).forEach(pid=>visibleSet.add(pid));
-        if (activeCustomId) updateCustomFilterIdsForUser(currentUserKey, activeCustomId, visibleSet);
         chart.resetZoom(); viewsChart.resetZoom(); first24HoursChart.resetZoom(); followersChart.resetZoom(); allViewsChart.resetZoom(); allLikesChart.resetZoom(); cameosChart.resetZoom();
         refreshUserUI({ skipRestoreZoom: true });
         persistVisibility();
       });
       $('#hideAll').addEventListener('click', ()=>{
-        const activeCustomId = getCustomFilterId(currentVisibilitySource);
         currentVisibilitySource = 'hideAll';
         setListActionActive('hideAll');
         visibleSet.clear();
-        if (activeCustomId) updateCustomFilterIdsForUser(currentUserKey, activeCustomId, visibleSet);
         chart.resetZoom(); viewsChart.resetZoom(); first24HoursChart.resetZoom(); followersChart.resetZoom(); allViewsChart.resetZoom(); allLikesChart.resetZoom(); cameosChart.resetZoom();
         refreshUserUI({ preserveEmpty: true, skipRestoreZoom: true });
         persistVisibility();
       });
-      const saveCustomBtn = $('#saveCustomFilter');
-      if (saveCustomBtn) {
-        saveCustomBtn.addEventListener('click', ()=>{
-          const wrap = $('#customFiltersWrap');
-          if (!wrap || !currentUserKey) return;
-          const existing = wrap.querySelector('.custom-filter-input');
-          if (existing) { existing.focus(); return; }
-          const input = document.createElement('input');
-          input.type = 'text';
-          input.maxLength = 16;
-          input.placeholder = 'Name your filter...';
-          input.className = 'custom-filter-input';
-          wrap.appendChild(input);
-          input.focus();
-          wireCustomFilterInput(input);
-        });
-      }
       $('#pastDay').addEventListener('click', ()=>{
         currentVisibilitySource = 'pastDay';
         setListActionActive('pastDay');
@@ -8123,10 +9243,10 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         if (!u) return;
         const now = Date.now();
         const cutoff = now - (24 * 60 * 60 * 1000);
-        const isTopToday = isTopTodayKey(currentUserKey);
+        const useRecencyFallback = isVirtualUserKey(currentUserKey);
         const mapped = Object.entries(u.posts||{}).map(([pid,p])=>({
           pid,
-          postTime: (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
+          postTime: (useRecencyFallback ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
           pidBI: pidBigInt(pid)
         }));
         const sorted = mapped.filter(x=>x.postTime>0 && x.postTime >= cutoff).sort((a,b)=>{
@@ -8147,10 +9267,10 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         if (!u) return;
         const now = Date.now();
         const cutoff = now - (7 * 24 * 60 * 60 * 1000);
-        const isTopToday = isTopTodayKey(currentUserKey);
+        const useRecencyFallback = isVirtualUserKey(currentUserKey);
         const mapped = Object.entries(u.posts||{}).map(([pid,p])=>({
           pid,
-          postTime: (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
+          postTime: (useRecencyFallback ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
           pidBI: pidBigInt(pid)
         }));
         const sorted = mapped.filter(x=>x.postTime>0 && x.postTime >= cutoff).sort((a,b)=>{
@@ -8197,10 +9317,10 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         setListActionActive('last5');
         const u = resolveUserForKey(metrics, currentUserKey);
         if (!u) return;
-        const isTopToday = isTopTodayKey(currentUserKey);
+        const useRecencyFallback = isVirtualUserKey(currentUserKey);
         const mapped = Object.entries(u.posts||{}).map(([pid,p])=>({
           pid,
-          postTime: (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
+          postTime: (useRecencyFallback ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
           pidBI: pidBigInt(pid)
         }));
         const withTs = mapped.filter(x=>x.postTime>0).sort((a,b)=>b.postTime - a.postTime);
@@ -8219,10 +9339,10 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         setListActionActive('last10');
         const u = resolveUserForKey(metrics, currentUserKey);
         if (!u) return;
-        const isTopToday = isTopTodayKey(currentUserKey);
+        const useRecencyFallback = isVirtualUserKey(currentUserKey);
         const mapped = Object.entries(u.posts||{}).map(([pid,p])=>({
           pid,
-          postTime: (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
+          postTime: (useRecencyFallback ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0,
           pidBI: pidBigInt(pid)
         }));
         const withTs = mapped.filter(x=>x.postTime>0).sort((a,b)=>b.postTime - a.postTime);
@@ -8304,10 +9424,11 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         const u = resolveUserForKey(metrics, currentUserKey);
         if (!u) return;
         const isTopToday = isTopTodayKey(currentUserKey);
+        const useRecencyFallback = isVirtualUserKey(currentUserKey);
         const now = Date.now();
         const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
         const mapped = Object.entries(u.posts||{}).map(([pid,p])=>{
-          const postTime = (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0;
+          const postTime = (useRecencyFallback ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0;
           const ageMs = postTime ? now - postTime : Infinity;
           const last = latestSnapshot(p.snapshots);
           return {
@@ -8380,10 +9501,11 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         const u = resolveUserForKey(metrics, currentUserKey);
         if (!u) return;
         const isTopToday = isTopTodayKey(currentUserKey);
+        const useRecencyFallback = isVirtualUserKey(currentUserKey);
         const now = Date.now();
         const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
         const mapped = Object.entries(u.posts||{}).map(([pid,p])=>{
-          const postTime = (isTopToday ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0;
+          const postTime = (useRecencyFallback ? (getPostTimeStrict(p) || getPostTimeForRecency(p)) : getPostTimeStrict(p)) || 0;
           const ageMs = postTime ? now - postTime : Infinity;
           const last = latestSnapshot(p.snapshots);
           return {
@@ -8477,7 +9599,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     }
     const initialUser = resolveUserForKey(metrics, currentUserKey);
     if (initialUser) {
-      const initAction = normalizeFilterAction(lastFilterAction) || normalizeFilterAction(currentVisibilitySource) || normalizeFilterAction(currentListActionId) || getSessionFilterAction();
+      const initAction = normalizeFilterAction(getSessionFilterAction(currentUserKey))
+        || normalizeFilterAction(currentVisibilitySource)
+        || normalizeFilterAction(currentListActionId);
       setListActionActive(initAction || 'showAll');
       const didClick = triggerFilterClick(initAction);
       if (!didClick) {
@@ -8497,13 +9621,43 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         await refreshUserUI();
       }
     }
+    if (hasBootCache) {
+      document.documentElement.classList.remove('is-booting');
+    }
 
     try {
       const st = await prefsPromise;
       const prevUserKey = currentUserKey;
-      if (st.lastUserKey && (metrics.users[st.lastUserKey] || isTopTodayKey(st.lastUserKey))) currentUserKey = st.lastUserKey;
+      if (st.lastUserKey && (metrics.users[st.lastUserKey] || isVirtualUserKey(st.lastUserKey))) {
+        currentUserKey = st.lastUserKey;
+      }
       zoomStates = st.zoomStates || {};
-      if (st.lastFilterAction && !lastFilterAction) lastFilterAction = st.lastFilterAction;
+      if (st.lastFilterAction && (!lastFilterAction || lastFilterAction === 'showAll')) {
+        lastFilterAction = st.lastFilterAction;
+      }
+      if (st.lastFilterActionByUser && typeof st.lastFilterActionByUser === 'object') {
+        for (const [userKey, action] of Object.entries(st.lastFilterActionByUser)) {
+          if (!lastFilterActionByUser[userKey]) lastFilterActionByUser[userKey] = action;
+        }
+      }
+      const storedViewsType = normalizeViewsChartType(st?.[VIEWS_TYPE_STORAGE_KEY]);
+      if (storedViewsType) {
+        if (!viewsChartTypeLoaded && storedViewsType !== viewsChartType) {
+          updateViewsType(storedViewsType);
+        }
+        viewsChartTypeLoaded = true;
+      }
+      const storedBestTimePrefs = normalizeBestTimePrefs(st?.[BEST_TIME_PREFS_KEY]);
+      if (storedBestTimePrefs) {
+        bestTimePrefsFromStorage = storedBestTimePrefs;
+        if (!bestTimePrefsLoaded) {
+          if (storedBestTimePrefs.range) bestTimeRange = storedBestTimePrefs.range;
+          if (storedBestTimePrefs.rec) bestTimeRec = storedBestTimePrefs.rec;
+          bestTimePrefsLoaded = true;
+          saveBestTimePrefs();
+          if (bestTimeData) renderBestTimeWidget(bestTimeData, bestTimeRange);
+        }
+      }
       customVisibilityByUser = (function(raw){
         const out = {};
         if (!raw || typeof raw !== 'object') return out;
@@ -8588,9 +9742,32 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         }
       }
       if (currentUserKey !== prevUserKey) {
-        await switchUserSelection(currentUserKey);
+        await switchUserSelection(currentUserKey, { useStoredFilter: true });
       } else {
         refreshUserUI({ preserveEmpty: true, skipRestoreZoom: true });
+      }
+      const restoreAction = normalizeFilterAction(getSessionFilterAction(currentUserKey));
+      if (restoreAction && restoreAction !== normalizeFilterAction(currentVisibilitySource)) {
+        const user = resolveUserForKey(metrics, currentUserKey);
+        if (user) {
+          const shouldRestore = (function(){
+            if (restoreAction === 'custom') {
+              const entry = getCustomVisibilityEntry(currentUserKey);
+              return Array.isArray(entry?.ids) && entry.ids.length > 0;
+            }
+            if (isCustomFilterAction(restoreAction)) {
+              const filterId = getCustomFilterId(restoreAction);
+              if (!filterId) return false;
+              return getCustomFiltersForUser(currentUserKey).some((f)=>f.id === filterId);
+            }
+            return true;
+          })();
+          if (shouldRestore) {
+            applyUserFilterState(currentUserKey, user, restoreAction);
+            await refreshUserUI({ preserveEmpty: true, skipRestoreZoom: true });
+            persistVisibility();
+          }
+        }
       }
     } catch {}
     if (!isMetricsPartial) {
@@ -8599,6 +9776,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     if (isMetricsPartial && !bestTimeData) {
       refreshData({ skipPostListRebuild: true, skipRestoreZoom: true })
         .catch((err) => console.error('[Dashboard] best time hydrate failed', err));
+    } else if (isMetricsPartial) {
+      hydrateMetricsFromStorageInChunks();
     }
     await ultraModePromise;
     renderCustomFilters(currentUserKey);
@@ -8607,18 +9786,36 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     initBestTimeGatherLink();
     initBestTimeInfoTooltip();
     initMetricsGatherLink();
-    const AUTO_REFRESH_MS = 30000;
     let autoRefreshInFlight = false;
-    setInterval(() => {
-      if (document.hidden) return;
-      if (autoRefreshInFlight) return;
+    let autoRefreshTimer = null;
+    const scheduleAutoRefresh = (delayMs, opts = {}) => {
+      const { resetCountdown = true } = opts;
+      if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+      if (resetCountdown) {
+        nextAutoRefreshAt = Date.now() + delayMs;
+        updateAutoRefreshCountdown(currentUserKey);
+      }
+      autoRefreshTimer = setTimeout(runAutoRefresh, delayMs);
+    };
+    const runAutoRefresh = () => {
+      if (document.hidden) {
+        scheduleAutoRefresh(1000, { resetCountdown: false });
+        return;
+      }
+      if (autoRefreshInFlight) {
+        scheduleAutoRefresh(1000, { resetCountdown: false });
+        return;
+      }
       autoRefreshInFlight = true;
       refreshData({ skipPostListRebuild: true, autoRefresh: true })
         .catch((err) => console.error('[Dashboard] auto refresh failed', err))
         .finally(() => {
           autoRefreshInFlight = false;
+          scheduleAutoRefresh(AUTO_REFRESH_MS, { resetCountdown: true });
         });
-    }, AUTO_REFRESH_MS);
+    };
+    startAutoRefreshCountdown();
+    scheduleAutoRefresh(AUTO_REFRESH_MS, { resetCountdown: true });
     perfEnd(perfBoot);
     perfFlush('boot');
   }
