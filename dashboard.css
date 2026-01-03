@@ -1531,15 +1531,6 @@ body.is-resizing{cursor:col-resize;user-select:none}
 .brought-by{
   margin:78px 0 16px;
 }
-.brought-by-title{
-  font-size:11px;
-  text-transform:none;
-  letter-spacing:0.02em;
-  color:var(--muted);
-  margin-bottom:12px;
-  font-weight:700;
-  font-family:var(--font-system);
-}
 .brought-by-grid{
   display:grid;
   grid-template-columns:repeat(3, minmax(220px, 1fr));

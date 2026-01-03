@@ -142,13 +142,7 @@
   const PERF_ENABLED = (function(){
     try { return localStorage.getItem(PERF_STORAGE_KEY) === '1'; } catch { return false; }
   })();
-  const CACHE_DEBUG_ENABLED = (function(){
-    try { return localStorage.getItem('SCT_DASHBOARD_CACHE_DEBUG') === '1'; } catch { return false; }
-  })();
-  const cacheLog = (...args)=>{
-    if (!CACHE_DEBUG_ENABLED) return;
-    try { console.log('[Dashboard][Cache]', ...args); } catch {}
-  };
+  const cacheLog = ()=>{};
   const PERF_AUTO_ENABLED = (function(){
     try { return localStorage.getItem(PERF_STORAGE_AUTO_KEY) === '1'; } catch { return false; }
   })();
@@ -164,11 +158,6 @@
   };
   const perfFlush = (label, log = true)=>{
     if (!PERF_ENABLED) return;
-    if (log && perfMarks.length) {
-      console.groupCollapsed(`[Dashboard] Perf ${label}`);
-      console.table(perfMarks);
-      console.groupEnd();
-    }
     perfMarks.length = 0;
   };
   const nextPaint = ()=> new Promise((resolve)=>{
@@ -633,9 +622,7 @@
         }
         return true;
       }
-    } catch (err) {
-      console.warn('[Dashboard] best time cache load failed', err);
-    }
+    } catch {}
     return false;
   }
 
@@ -1326,8 +1313,7 @@
         // Reconciliation logging removed.
       }
       return { moved, kept: Object.keys(metrics.users[userKey].posts).length };
-    } catch (e) {
-      try { console.warn('[Dashboard] pruneMismatchedPostsForUser failed', e); } catch {}
+    } catch {
       return { moved: [], kept: 0 };
     }
   }
@@ -1362,8 +1348,7 @@
         await saveMetrics(metrics, { userKeys: [userKey] });
       }
       return { removed };
-    } catch(e){
-      try { console.warn('[Dashboard] pruneEmptyPostsForUser failed', e); } catch {}
+    } catch {
       return { removed: [] };
     }
   }
@@ -1398,8 +1383,7 @@
         await saveMetrics(metrics, { userKeys: [userKey, 'unknown'] });
       }
       return { moved };
-    } catch(e){
-      try { console.warn('[Dashboard] reclaimFromUnknown failed', e); } catch {}
+    } catch {
       return { moved: 0 };
     }
   }
@@ -4874,9 +4858,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       a.click();
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-    } catch (e) {
-      console.error('[Dashboard] Export all data failed', e);
-      alert('Export failed. Please check the console for details.');
+    } catch {
+      alert('Export failed. Please try again.');
     }
   }
 
@@ -5012,8 +4995,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       window.location.reload();
       
     } catch (e) {
-      console.error('[Dashboard] Import failed', e);
-      alert('Import failed: ' + (e.message || 'Unknown error. Please check the console for details.'));
+      alert('Import failed: ' + (e.message || 'Unknown error. Please try again.'));
     }
   }
 
@@ -6051,7 +6033,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (isMetricsPartial && !resolveUserForKey(metrics, userKey)) {
         refreshData({ skipPostListRebuild: false, skipRestoreZoom: true })
           .then(() => addCompareUser(userKey))
-          .catch((err) => console.error('[Dashboard] compare hydrate failed', err));
+          .catch(() => {});
         return;
       }
       if (!resolveUserForKey(metrics, userKey)) return;
@@ -7488,8 +7470,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
               }
             };
             tick();
-          } catch (err) {
-            console.warn('[Dashboard] metrics hydrate failed', err);
+          } catch {
             setMetricsHydrateState(false);
             resolve(false);
           }
@@ -8369,8 +8350,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         if (purgeStorageSize) {
           purgeStorageSize.textContent = `Sora Creator Tools uses ${mb}MB of storage.\nExported data file will be larger because it's less overlapping.`;
         }
-      } catch (e) {
-        console.error('[Dashboard] Failed to calculate storage size', e);
+      } catch {
         if (purgeStorageSize) {
           purgeStorageSize.textContent = 'Sora Creator Tools uses 0.00MB of storage.';
         }
@@ -8449,9 +8429,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             await updateStorageSizeDisplay();
           }
         }
-      } catch (e) {
-        console.error('[Comb Mode] Purge failed', e);
-      } finally {
+      } catch {} finally {
         await chrome.storage.local.remove('purgeLock');
       }
     }
@@ -8479,9 +8457,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             // Schedule next run
             scheduleNextRun();
           }, delay);
-        } catch (e) {
-          console.error('[Comb Mode] Failed to schedule daily purge', e);
-        }
+        } catch {}
       }
       
       scheduleNextRun();
@@ -8903,9 +8879,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             renderComparePills();
             refreshUserUI();
             updateBestTimeToPostSection();
-          } catch (e) {
-            console.error('[Dashboard] Optimistic purge failed', e);
-          } finally {
+          } catch {} finally {
             setPurgeSidebarHidden(false);
           }
         });
@@ -8920,8 +8894,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           await updateStorageSizeDisplay();
           alert(`Purge complete!\n\nRemoved ${purgedUsers} user(s) and ${purgedPosts} post(s).`);
         } catch (e) {
-          console.error('[Dashboard] Purge failed', e);
-          alert('Purge failed. Please check the console for details.');
+          alert('Purge failed. Please try again.');
         } finally {
           await chrome.storage.local.remove('purgeLock');
         }
@@ -8991,7 +8964,6 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           const { removedAny, affectedKeys } = removePostFromMetrics(loadedMetrics, pid);
           if (removedAny) await saveMetrics(loadedMetrics, { userKeys: Array.from(affectedKeys) });
         } catch (e) {
-          console.error('[Dashboard] Post purge failed', e);
           alert('Failed to purge this post. Please try again.');
           try {
             metrics = await loadMetrics();
@@ -9775,7 +9747,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     }
     if (isMetricsPartial && !bestTimeData) {
       refreshData({ skipPostListRebuild: true, skipRestoreZoom: true })
-        .catch((err) => console.error('[Dashboard] best time hydrate failed', err));
+        .catch(() => {});
     } else if (isMetricsPartial) {
       hydrateMetricsFromStorageInChunks();
     }
@@ -9808,7 +9780,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       }
       autoRefreshInFlight = true;
       refreshData({ skipPostListRebuild: true, autoRefresh: true })
-        .catch((err) => console.error('[Dashboard] auto refresh failed', err))
+        .catch(() => {})
         .finally(() => {
           autoRefreshInFlight = false;
           scheduleAutoRefresh(AUTO_REFRESH_MS, { resetCountdown: true });
