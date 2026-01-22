@@ -31,6 +31,12 @@
   "host_permissions": ["https://sora.chatgpt.com/*"],
   "permissions": ["storage", "unlimitedStorage"],
   "background": {
-    "service_worker": "background.js"
+    "scripts": ["background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "sora-creator-tools@fancyson-ai",
+      "strict_min_version": "109.0"
+    }
   }
 }
