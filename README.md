@@ -62,14 +62,18 @@ Note: Temporary add-ons are removed when Firefox restarts. For permanent install
 ## Install (Mobile)
 
 ### Mobile Chrome
-Chrome on mobile does not support installing extensions.
+Chrome on mobile (Android/iOS) does not support installing extensions.
 
-Workaround (Android): use a Chromium-based browser that supports extensions (example: Kiwi Browser) and load/install the extension there.
+Workaround (Android): use a Chromium-based browser that supports extensions (example: Kiwi Browser).
+1. On Desktop Chrome: open `chrome://extensions` and enable **Developer mode**.
+2. Click **Pack extension** and select the folder that contains `manifest.json` to produce a `.crx`.
+3. Copy the `.crx` to your Android phone.
+4. Open/install the `.crx` in your extension-capable Android browser (vendor-specific UI).
 
 ### Mobile Firefox
 Firefox on mobile only supports a limited add-on install flow.
 
-- Android: You typically need Firefox Nightly (or a build that supports custom add-on collections) and a signed add-on to install a custom extension.
+- Android: To install a custom extension, you typically need Firefox Nightly (custom add-on collection) and a signed add-on (`.xpi`).
 - iOS: Custom extensions are not supported in Firefox for iOS.
 
 ## Use it
