@@ -2038,6 +2038,40 @@
     window.addEventListener('resize', ()=>{ current = applyWidth(current); });
   }
 
+  function initMobileSidebarDrawer(){
+    const toggleBtn = document.getElementById('mobileSidebarToggle');
+    const closeBtn = document.getElementById('mobileSidebarClose');
+    const backdrop = document.getElementById('sidebarBackdrop');
+    const sidebar = document.getElementById('sidebarPanel');
+    if (!toggleBtn || !sidebar) return;
+
+    const mq = window.matchMedia('(max-width: 900px)');
+    const setOpen = (open)=>{
+      document.documentElement.classList.toggle('is-sidebar-open', !!open);
+      document.body.classList.toggle('is-sidebar-open', !!open);
+      try { toggleBtn.setAttribute('aria-expanded', open ? 'true' : 'false'); } catch {}
+    };
+    const isOpen = ()=> document.body.classList.contains('is-sidebar-open');
+    const open = ()=>{
+      if (!mq.matches) return;
+      setOpen(true);
+      const search = document.getElementById('search');
+      if (search && document.activeElement !== search) {
+        try { search.focus({ preventScroll: false }); } catch { try { search.focus(); } catch {} }
+      }
+    };
+    const close = ()=> setOpen(false);
+
+    toggleBtn.addEventListener('click', ()=>{ isOpen() ? close() : open(); });
+    if (closeBtn) closeBtn.addEventListener('click', close);
+    if (backdrop) backdrop.addEventListener('click', close);
+    window.addEventListener('keydown', (e)=>{ if (e.key === 'Escape') close(); });
+
+    const onViewportChange = ()=>{ if (!mq.matches) close(); };
+    try { mq.addEventListener('change', onViewportChange); }
+    catch { try { mq.addListener(onViewportChange); } catch {} }
+  }
+
   function buildPostLabelKey(p){
     const cameoKey = Array.isArray(p.cameos) ? p.cameos.join('|') : '';
     const caption = p.caption || p.pid || '';
@@ -5398,6 +5432,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
   async function main(prefetchedCache){
     const perfBoot = perfStart('boot total');
     initSidebarResizer();
+    initMobileSidebarDrawer();
     initThemePicker();
     hoistChartTooltips();
     const cached = prefetchedCache !== undefined ? prefetchedCache : loadInstantCache();
