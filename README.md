@@ -73,7 +73,11 @@ Workaround (Android): use a Chromium-based browser that supports extensions (exa
 ### Mobile Firefox
 Firefox on mobile only supports a limited add-on install flow.
 
-- Android: To install a custom extension, you typically need Firefox Nightly (custom add-on collection) and a signed add-on (`.xpi`).
+- Android (recommended path): Firefox Nightly + a custom add-on collection + a signed add-on (`.xpi`).
+  1. Create a zip of this repo folder (exclude `.git/`).
+  2. Upload it to addons.mozilla.org as an **unlisted** add-on to get it signed and download the signed `.xpi`.
+  3. Create a custom add-on collection on AMO and add your add-on to that collection.
+  4. In Firefox Nightly (Android), configure **Custom Add-on Collection** (AMO user id + collection name), restart, then install the add-on from the collection.
 - iOS: Custom extensions are not supported in Firefox for iOS.
 
 ## Use it
