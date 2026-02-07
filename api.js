@@ -1344,14 +1344,7 @@
     const group = durationSubmenuEl.querySelector('[role="group"]');
     if (!group) return;
 
-    // Don't show injected time options on the storyboard route.
-    if (isStoryboardRoute()) {
-      try {
-        const injected = group.querySelectorAll('[data-sct-duration-option]');
-        injected.forEach((el) => el.remove());
-      } catch {}
-      return;
-    }
+    // Intentionally allow injected durations on the storyboard route as well.
 
     const template = group.querySelector('[role="menuitemradio"]');
     if (!template) return;

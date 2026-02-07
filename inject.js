@@ -520,7 +520,7 @@
   const isTopFeed = () => {
     try {
       const u = new URL(location.href);
-      return u.origin === 'https://sora.chatgpt.com' && u.pathname === '/explore' && u.searchParams.get('feed') === 'top';
+      return u.pathname === '/explore' && u.searchParams.get('feed') === 'top';
     } catch {
       return false;
     }
@@ -2200,12 +2200,12 @@
 
         if (remixTargetPostId) {
           // This is a remix of a post - navigate to the post remix page
-          const remixUrl = `https://sora.chatgpt.com/p/${remixTargetPostId}?remix=`;
+          const remixUrl = `${location.origin}/p/${remixTargetPostId}?remix=`;
           sessionStorage.setItem('SORA_UV_REDO_PROMPT', prompt);
           window.location.href = remixUrl;
         } else if (remixTargetDraftId) {
           // This is a remix of a draft - navigate to the draft remix page
-          const remixUrl = `https://sora.chatgpt.com/d/${remixTargetDraftId}?remix=`;
+          const remixUrl = `${location.origin}/d/${remixTargetDraftId}?remix=`;
           sessionStorage.setItem('SORA_UV_REDO_PROMPT', prompt);
           window.location.href = remixUrl;
         } else {
@@ -2306,7 +2306,7 @@
         }
 
         // Navigate to the remix page for this draft
-        const remixUrl = `https://sora.chatgpt.com/d/${draftId}?remix=`;
+        const remixUrl = `${location.origin}/d/${draftId}?remix=`;
         window.location.href = remixUrl;
       });
 
@@ -3334,10 +3334,9 @@
 
     let impactText = null;
     try {
-      const u = new URL(location.href);
       const handle = currentProfileHandleFromURL();
-      if (u.origin === 'https://sora.chatgpt.com' && handle && handle.toLowerCase() === 'sora') impactText = '∞';
-      if (u.origin === 'https://sora.chatgpt.com' && handle && handle.toLowerCase() === 'sama') impactText = '∞';
+      if (handle && handle.toLowerCase() === 'sora') impactText = '∞';
+      if (handle && handle.toLowerCase() === 'sama') impactText = '∞';
     } catch {}
     if (!impactText) impactText = formatImpactRatio(likes, followers);
 
