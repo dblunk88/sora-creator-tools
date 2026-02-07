@@ -52,17 +52,20 @@ Plus **DASHBOARD MODE:** Click on the extension icon to open a full-page dashboa
 6. (Optional) Pin the extension in the toolbar.
 
 ### Desktop Firefox (temporary add-on, for development)
+Note: Firefox add-on validation currently requires a `background.scripts` fallback (MV2-style), so this repo ships a separate Firefox manifest (`manifest.firefox.json`). Use the build script below to generate a Firefox-ready package.
+
 1. Clone/download this repo.
-2. Open `about:debugging#/runtime/this-firefox`.
-3. Click **Load Temporary Add-on...**
-4. Select `manifest.json` from the repo folder.
+2. Build the Firefox package: `./scripts/build-firefox.sh`
+3. Open `about:debugging#/runtime/this-firefox`.
+4. Click **Load Temporary Add-on...**
+5. Select `dist/firefox/manifest.json`.
 
 Note: Temporary add-ons are removed when Firefox restarts.
 
 ### Desktop Firefox (permanent install)
 Firefox typically requires signed add-ons. To install permanently, create a signed `.xpi` and install it:
-1. Zip the extension files so `manifest.json` is at the **root** of the zip (exclude `.git/`).
-2. Upload the zip to addons.mozilla.org as an **unlisted** add-on to get it signed and download the signed `.xpi`.
+1. Build the Firefox package: `./scripts/build-firefox.sh`
+2. Upload `dist/sora-creator-tools-firefox.zip` to addons.mozilla.org as an **unlisted** add-on to get it signed and download the signed `.xpi`.
 3. In Firefox Desktop: open `about:addons` and use **Install Add-on From File...** to select the signed `.xpi`.
 
 ## Mobile
@@ -76,8 +79,8 @@ Android workaround: use an extension-capable Chromium browser (example: Kiwi Bro
 Firefox on mobile only supports a limited add-on install flow.
 
 - Android (recommended path): Firefox Nightly + a custom add-on collection + a signed add-on (`.xpi`).
-  1. Create a zip of this repo folder (exclude `.git/`).
-  2. Upload it to addons.mozilla.org as an **unlisted** add-on to get it signed and download the signed `.xpi`.
+  1. Build the Firefox package: `./scripts/build-firefox.sh`
+  2. Upload `dist/sora-creator-tools-firefox.zip` to addons.mozilla.org as an **unlisted** add-on to get it signed and download the signed `.xpi`.
   3. Create a custom add-on collection on AMO and add your add-on to that collection.
   4. In Firefox Nightly (Android), configure **Custom Add-on Collection** (AMO user id + collection name), restart, then install the add-on from the collection.
 - iOS: Custom extensions are not supported in Firefox for iOS.
