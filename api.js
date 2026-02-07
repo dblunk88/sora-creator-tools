@@ -539,6 +539,32 @@
   const DURATION_FRAMES_MIN = 5 * SCT_FPS;
   const DURATION_FRAMES_MAX = 60 * SCT_FPS;
   const DURATION_TICK_SECONDS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60];
+  const DURATION_SNAP_THRESHOLD_FRAMES = 10;
+
+  function getSnapFrames(frames, { include24s } = {}) {
+    const f = Number(frames);
+    if (!Number.isFinite(f)) return null;
+
+    let best = null;
+    let bestDist = DURATION_SNAP_THRESHOLD_FRAMES + 1;
+    for (const sec of DURATION_TICK_SECONDS) {
+      const target = sec * SCT_FPS;
+      const dist = Math.abs(target - f);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = target;
+      }
+    }
+    if (include24s) {
+      const target = 24 * SCT_FPS;
+      const dist = Math.abs(target - f);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = target;
+      }
+    }
+    return bestDist <= DURATION_SNAP_THRESHOLD_FRAMES ? best : null;
+  }
 
   function clampInt(value, min, max) {
     const n = Number(value);
@@ -1510,6 +1536,11 @@
       group.querySelectorAll('[data-sct-duration-option]').forEach((el) => el.remove());
     } catch {}
 
+    // Hide Sora's native duration radio options; we drive duration via the custom slider below.
+    try {
+      group.hidden = true;
+    } catch {}
+
     const getMenuItemSeconds = (el) => {
       const label = (el?.querySelector?.('span.truncate')?.textContent || el?.textContent || '').trim();
       const m = label.match(/(\d+)\s*seconds?/i) || label.match(/(\d+)\s*s\b/i);
@@ -1583,7 +1614,6 @@
     let slider = null;
     let currentEl = null;
     let subtextEl = null;
-    let ticksEl = null;
     let timeInput = null;
     let framesInput = null;
 
@@ -1631,10 +1661,6 @@
       slider.className = 'relative z-10 h-6 w-full cursor-pointer';
       track.appendChild(slider);
 
-      ticksEl = document.createElement('div');
-      ticksEl.dataset.sctDurationTicks = '1';
-      ticksEl.className = 'mt-1';
-
       const inputs = document.createElement('div');
       inputs.className = 'mt-1 flex items-end gap-2';
 
@@ -1674,25 +1700,52 @@
       sliderWrap.appendChild(header);
       sliderWrap.appendChild(subtextEl);
       sliderWrap.appendChild(track);
-      sliderWrap.appendChild(ticksEl);
       sliderWrap.appendChild(inputs);
 
       durationSubmenuEl.appendChild(sep);
       durationSubmenuEl.appendChild(sliderWrap);
 
       // Wire up listeners once.
+      let inputApplyTimer = null;
+      const clearInputApplyTimer = () => {
+        try {
+          if (inputApplyTimer) clearTimeout(inputApplyTimer);
+        } catch {}
+        inputApplyTimer = null;
+      };
+      const scheduleInputApply = (frames) => {
+        clearInputApplyTimer();
+        inputApplyTimer = setTimeout(() => {
+          try {
+            applyFrames(frames);
+          } catch {}
+        }, 250);
+      };
+
       slider.addEventListener('input', (ev) => {
         try {
-          const v = clampInt(ev?.target?.value, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
-          const seconds = framesToSeconds(v);
-          const short = formatSecondsShort(seconds);
-          if (currentEl) currentEl.textContent = short;
-          if (subtextEl) subtextEl.textContent = `${v} frames`;
-
+          let v = clampInt(ev?.target?.value, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
           const maxFrames = Number(sliderWrap?.dataset?.sctSupportedMaxFrames || '');
           const maxSeconds = Number(sliderWrap?.dataset?.sctSupportedMaxSeconds || '');
           const supportedFramesNow = Number.isFinite(maxFrames) ? maxFrames : supportedMaxFrames;
           const supportedSecondsNow = Number.isFinite(maxSeconds) ? maxSeconds : supportedMaxSeconds;
+
+          // "Lock" at 5s marks (and 24s for Sora 2 Pro High) when the user is dragging the slider.
+          // Avoid snapping synthetic events fired by our own code (typing in the inputs).
+          if (ev && ev.isTrusted) {
+            const snapped = getSnapFrames(v, { include24s: supportedSecondsNow === 24 });
+            if (snapped != null) {
+              v = snapped;
+              try {
+                if (slider && slider.value !== String(v)) slider.value = String(v);
+              } catch {}
+            }
+          }
+
+          const seconds = framesToSeconds(v);
+          const short = formatSecondsShort(seconds);
+          if (currentEl) currentEl.textContent = short;
+          if (subtextEl) subtextEl.textContent = `${v} frames`;
 
           const unsupported = v > supportedFramesNow;
           if (currentEl) currentEl.dataset.unsupported = unsupported ? '1' : '';
@@ -1700,23 +1753,28 @@
 
           if (document.activeElement !== timeInput && timeInput) timeInput.value = short;
           if (document.activeElement !== framesInput && framesInput) framesInput.value = String(v);
-
-          // Keep ticks selection in sync while dragging.
-          try {
-            const btns = sliderWrap.querySelectorAll('button[data-sct-duration-tick="1"]');
-            btns.forEach((b) => {
-              const sec = Number(b.dataset.sctTickSeconds || '');
-              const f = Number(b.dataset.sctTickFrames || '');
-              b.dataset.selected = Number.isFinite(f) && f === v ? '1' : '';
-              const unsupportedTick = Number.isFinite(sec) && sec > supportedSecondsNow;
-              b.dataset.unsupported = unsupportedTick ? '1' : '';
-            });
-          } catch {}
         } catch {}
       });
       slider.addEventListener('change', (ev) => {
         try {
-          const v = clampInt(ev?.target?.value, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
+          let v = clampInt(ev?.target?.value, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
+          const maxSeconds = Number(sliderWrap?.dataset?.sctSupportedMaxSeconds || '');
+          const supportedSecondsNow = Number.isFinite(maxSeconds) ? maxSeconds : supportedMaxSeconds;
+
+          if (ev && ev.isTrusted) {
+            const snapped = getSnapFrames(v, { include24s: supportedSecondsNow === 24 });
+            if (snapped != null) v = snapped;
+          }
+
+          // Ensure UI matches the snapped final value.
+          try {
+            if (slider && slider.value !== String(v)) {
+              slider.value = String(v);
+              slider.dispatchEvent(new Event('input'));
+            }
+          } catch {}
+
+          clearInputApplyTimer();
           applyFrames(v);
           keepSettingsMenuOpenSoon();
         } catch {}
@@ -1724,6 +1782,7 @@
 
       const commitTime = () => {
         try {
+          clearInputApplyTimer();
           const sec = parseTimeToSeconds(timeInput?.value);
           if (sec == null) return;
           const frames = secondsToFrames(sec);
@@ -1737,6 +1796,7 @@
       };
       const commitFrames = () => {
         try {
+          clearInputApplyTimer();
           const raw = String(framesInput?.value || '').trim();
           const n = raw ? Number(raw) : NaN;
           if (!Number.isFinite(n)) return;
@@ -1749,6 +1809,33 @@
           keepSettingsMenuOpenSoon();
         } catch {}
       };
+
+      timeInput.addEventListener('input', () => {
+        try {
+          const sec = parseTimeToSeconds(timeInput?.value);
+          if (sec == null) return;
+          const frames = secondsToFrames(sec);
+          if (slider) {
+            slider.value = String(frames);
+            slider.dispatchEvent(new Event('input'));
+          }
+          scheduleInputApply(frames);
+        } catch {}
+      });
+
+      framesInput.addEventListener('input', () => {
+        try {
+          const raw = String(framesInput?.value || '').trim();
+          const n = raw ? Number(raw) : NaN;
+          if (!Number.isFinite(n)) return;
+          const frames = clampInt(n, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
+          if (slider) {
+            slider.value = String(frames);
+            slider.dispatchEvent(new Event('input'));
+          }
+          scheduleInputApply(frames);
+        } catch {}
+      });
 
       timeInput.addEventListener('keydown', (ev) => {
         if ((ev?.key || '') === 'Enter') commitTime();
@@ -1773,7 +1860,9 @@
       slider = sliderWrap.querySelector('input[type="range"][data-sct-duration-range="1"]');
       currentEl = sliderWrap.querySelector('[data-sct-duration-current="1"]');
       subtextEl = sliderWrap.querySelector('[data-sct-duration-subtext="1"]');
-      ticksEl = sliderWrap.querySelector('[data-sct-duration-ticks="1"]');
+      try {
+        sliderWrap.querySelectorAll('[data-sct-duration-ticks="1"]').forEach((el) => el.remove());
+      } catch {}
       timeInput = sliderWrap.querySelector('input[data-sct-duration-time="1"]');
       framesInput = sliderWrap.querySelector('input[data-sct-duration-frames="1"]');
     }
@@ -1809,46 +1898,6 @@
     }
     if (currentFrames == null) currentFrames = DURATION_FRAMES_MIN;
 
-    // Ensure ticks exist and are correct for the current settings.
-    try {
-      const ticksKey = isSora2ProHigh ? 'prohigh' : 'default';
-      if (ticksEl && sliderWrap.dataset.sctTicksKey !== ticksKey) {
-        sliderWrap.dataset.sctTicksKey = ticksKey;
-        ticksEl.innerHTML = '';
-        const secondsList = Array.from(new Set([...(DURATION_TICK_SECONDS || []), ...(isSora2ProHigh ? [24] : [])])).sort((a, b) => a - b);
-        for (const sec of secondsList) {
-          const frames = sec * SCT_FPS;
-          const btn = document.createElement('button');
-          btn.type = 'button';
-          btn.dataset.sctDurationTick = '1';
-          btn.dataset.sctTickSeconds = String(sec);
-          btn.dataset.sctTickFrames = String(frames);
-          btn.textContent = `${sec}s`;
-          const unsupportedTick = sec > supportedMaxSeconds;
-          btn.dataset.unsupported = unsupportedTick ? '1' : '';
-          btn.dataset.selected = frames === currentFrames ? '1' : '';
-          btn.addEventListener('click', (ev) => {
-            try {
-              ev.preventDefault();
-              ev.stopPropagation();
-            } catch {}
-            try {
-              if (slider) {
-                slider.value = String(frames);
-                slider.dispatchEvent(new Event('input'));
-              }
-              applyFrames(frames);
-              // Update selection styles.
-              const btns = sliderWrap.querySelectorAll('button[data-sct-duration-tick="1"]');
-              btns.forEach((b) => (b.dataset.selected = b === btn ? '1' : ''));
-              keepSettingsMenuOpenSoon();
-            } catch {}
-          });
-          ticksEl.appendChild(btn);
-        }
-      }
-    } catch {}
-
     // Sync UI to current value.
     try {
       const seconds = framesToSeconds(currentFrames);
@@ -1861,16 +1910,6 @@
       if (subtextEl) subtextEl.dataset.unsupported = unsupported ? '1' : '';
       if (timeInput && document.activeElement !== timeInput) timeInput.value = short;
       if (framesInput && document.activeElement !== framesInput) framesInput.value = String(currentFrames);
-      try {
-        const btns = sliderWrap.querySelectorAll('button[data-sct-duration-tick="1"]');
-        btns.forEach((b) => {
-          const sec = Number(b.dataset.sctTickSeconds || '');
-          const f = Number(b.dataset.sctTickFrames || '');
-          b.dataset.selected = Number.isFinite(f) && f === currentFrames ? '1' : '';
-          const unsupportedTick = Number.isFinite(sec) && sec > supportedMaxSeconds;
-          b.dataset.unsupported = unsupportedTick ? '1' : '';
-        });
-      } catch {}
     } catch {}
   }
 
