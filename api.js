@@ -1534,21 +1534,6 @@
     const settings = getSoraSettings();
     const allow25 = shouldOffer25s(settings);
     const allow5 = !isRemixEmptyQuery();
-    const isSora2ProHigh = planIsFree !== true && settings?.model === 'sora2pro' && settings?.resolution === 'high';
-    const supportedMaxSeconds = isSora2ProHigh ? 24 : 25;
-    const supportedMaxFrames = supportedMaxSeconds * SCT_FPS;
-
-    ensureDurationSliderStyles();
-
-    // Remove legacy injected duration options from older builds.
-    try {
-      group.querySelectorAll('[data-sct-duration-option]').forEach((el) => el.remove());
-    } catch {}
-
-    // Hide Sora's native duration radio options; we drive duration via the custom slider below.
-    try {
-      group.hidden = true;
-    } catch {}
 
     const getMenuItemSeconds = (el) => {
       const label = (el?.querySelector?.('span.truncate')?.textContent || el?.textContent || '').trim();
@@ -1558,40 +1543,29 @@
       return Number.isFinite(n) ? n : null;
     };
 
-    const setDurationMenuValueLabel = (text) => {
-      try {
-        const durationMenuItems = Array.from(document.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]')).filter((mi) =>
-          (mi.textContent || '').includes('Duration')
-        );
-        for (const mi of durationMenuItems) {
-          const valueEl = findDurationMenuValueEl(mi);
-          if (valueEl) valueEl.textContent = text;
-        }
-      } catch {}
-    };
+    // Remove legacy injected duration options from older builds.
+    try {
+      group.querySelectorAll('[data-sct-duration-option]').forEach((el) => el.remove());
+    } catch {}
 
-    const applyFrames = (frames) => {
-      const f = clampInt(frames, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
-      if (f === 0) {
-        clearDurationOverride();
-        try {
-          const checked = group.querySelector('[role="menuitemradio"][aria-checked="true"]');
-          const sec = getMenuItemSeconds(checked);
-          if (sec != null) {
-            setDurationMenuValueLabel(`${sec}s`);
-            scheduleVideoGensWarning(sec);
-          } else {
-            setDurationMenuValueLabel('0s');
-          }
-        } catch {}
-        return { frames: 0, seconds: 0 };
-      }
-      const seconds = framesToSeconds(f);
-      writeDurationOverride({ seconds, frames: f });
-      setDurationMenuValueLabel(formatSecondsShort(seconds));
-      scheduleVideoGensWarning(seconds);
-      return { frames: f, seconds };
-    };
+    // Restore native dropdown/radio list (older builds used a custom slider and hid this).
+    try {
+      group.hidden = false;
+    } catch {}
+
+    // Remove custom slider UI if it was injected by a previous version.
+    try {
+      durationSubmenuEl
+        .querySelectorAll(
+          '[data-sct-duration-slider="1"],[data-sct-duration-slider-sep="1"],#sct-duration-slider-style'
+        )
+        .forEach((el) => el.remove());
+    } catch {}
+
+    // Clear any persisted custom override from the removed slider UI.
+    try {
+      if (getDurationOverride()) clearDurationOverride();
+    } catch {}
 
     // Remove 5s option when remix is active.
     if (!allow5) {
@@ -1601,11 +1575,6 @@
           const sec = getMenuItemSeconds(el);
           if (sec === 5) el.remove();
         });
-      } catch {}
-
-      try {
-        const override = getDurationOverride();
-        if (override && Number.isFinite(override.frames) && override.frames === 5 * SCT_FPS) clearDurationOverride();
       } catch {}
     }
 
@@ -1618,330 +1587,7 @@
           if (sec === 25) el.remove();
         });
       } catch {}
-
-      // If >=25s was selected via override, clear it so we don't keep rewriting API requests.
-      try {
-        const override = getDurationOverride();
-        if (override && Number.isFinite(override.frames) && override.frames >= 25 * SCT_FPS) {
-          clearDurationOverride();
-          // Best-effort: update the parent menu value label to whichever built-in option is selected.
-          const checked = group.querySelector('[role="menuitemradio"][aria-checked="true"]');
-          const sec = getMenuItemSeconds(checked);
-          if (sec != null) setDurationMenuValueLabel(`${sec}s`);
-        }
-      } catch {}
     }
-
-    // Inject a slider + inputs at the bottom of the duration menu.
-    let sliderWrap = durationSubmenuEl.querySelector('[data-sct-duration-slider="1"]');
-    let slider = null;
-    let currentEl = null;
-    let subtextEl = null;
-    let timeInput = null;
-    let framesInput = null;
-
-    if (!sliderWrap) {
-      const sep = document.createElement('div');
-      sep.setAttribute('role', 'separator');
-      sep.setAttribute('aria-orientation', 'horizontal');
-      sep.className = 'my-1.5 h-px bg-token-bg-light mx-3';
-      sep.dataset.sctDurationSliderSep = '1';
-
-      sliderWrap = document.createElement('div');
-      sliderWrap.dataset.sctDurationSlider = '1';
-      sliderWrap.className = 'flex max-w-[280px] flex-col gap-2 px-3 pb-2 pt-2 text-token-text-tertiary';
-
-      const header = document.createElement('div');
-      header.className = 'flex items-baseline justify-between gap-2';
-
-      const title = document.createElement('div');
-      title.className = 'text-xs font-semibold text-token-text-secondary';
-      title.textContent = 'Custom duration';
-
-      currentEl = document.createElement('div');
-      currentEl.dataset.sctDurationCurrent = '1';
-      currentEl.className = 'text-xs font-semibold tabular-nums';
-
-      header.appendChild(title);
-      header.appendChild(currentEl);
-
-      subtextEl = document.createElement('div');
-      subtextEl.dataset.sctDurationSubtext = '1';
-      subtextEl.className = 'text-[11px] leading-[14px] text-token-text-tertiary';
-      subtextEl.textContent = '';
-
-      const track = document.createElement('div');
-      track.className = 'relative flex h-6 w-full items-center';
-
-      slider = document.createElement('input');
-      slider.type = 'range';
-      slider.min = String(DURATION_FRAMES_MIN);
-      slider.max = String(DURATION_FRAMES_MAX);
-      slider.step = '1';
-      slider.value = String(DURATION_FRAMES_MIN);
-      slider.dataset.sctDurationRange = '1';
-      slider.setAttribute('aria-label', 'Duration');
-      slider.className = 'relative z-10 h-6 w-full cursor-pointer';
-      track.appendChild(slider);
-
-      const inputs = document.createElement('div');
-      inputs.className = 'mt-1 flex items-end gap-2';
-
-      const timeWrap = document.createElement('div');
-      timeWrap.className = 'flex-1';
-      const timeLabel = document.createElement('div');
-      timeLabel.className = 'mb-1 text-[11px] font-medium text-token-text-secondary';
-      timeLabel.textContent = 'Time (editable)';
-      timeInput = document.createElement('input');
-      timeInput.type = 'text';
-      timeInput.inputMode = 'decimal';
-      timeInput.autocomplete = 'off';
-      timeInput.spellcheck = false;
-      timeInput.placeholder = 'e.g. 24.5s or 0:24.5';
-      timeInput.dataset.sctDurationTime = '1';
-      timeInput.title = 'Type a time like 24.5s or 0:24.5';
-      timeWrap.appendChild(timeLabel);
-      timeWrap.appendChild(timeInput);
-
-      const framesWrap = document.createElement('div');
-      framesWrap.style.width = '96px';
-      const framesLabel = document.createElement('div');
-      framesLabel.className = 'mb-1 text-[11px] font-medium text-token-text-secondary';
-      framesLabel.textContent = 'Frames (editable)';
-      framesInput = document.createElement('input');
-      framesInput.type = 'text';
-      framesInput.inputMode = 'numeric';
-      framesInput.autocomplete = 'off';
-      framesInput.spellcheck = false;
-      framesInput.placeholder = 'e.g. 750';
-      framesInput.dataset.sctDurationFrames = '1';
-      framesInput.title = 'Type an integer number of frames';
-      framesWrap.appendChild(framesLabel);
-      framesWrap.appendChild(framesInput);
-
-      inputs.appendChild(timeWrap);
-      inputs.appendChild(framesWrap);
-
-      sliderWrap.appendChild(header);
-      sliderWrap.appendChild(subtextEl);
-      sliderWrap.appendChild(track);
-      sliderWrap.appendChild(inputs);
-
-      durationSubmenuEl.appendChild(sep);
-      durationSubmenuEl.appendChild(sliderWrap);
-
-      // Wire up listeners once.
-      let inputApplyTimer = null;
-      const clearInputApplyTimer = () => {
-        try {
-          if (inputApplyTimer) clearTimeout(inputApplyTimer);
-        } catch {}
-        inputApplyTimer = null;
-      };
-      const scheduleInputApply = (frames) => {
-        clearInputApplyTimer();
-        inputApplyTimer = setTimeout(() => {
-          try {
-            applyFrames(frames);
-          } catch {}
-        }, 250);
-      };
-
-      slider.addEventListener('input', (ev) => {
-        try {
-          let v = clampInt(ev?.target?.value, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
-          const maxFrames = Number(sliderWrap?.dataset?.sctSupportedMaxFrames || '');
-          const maxSeconds = Number(sliderWrap?.dataset?.sctSupportedMaxSeconds || '');
-          const supportedFramesNow = Number.isFinite(maxFrames) ? maxFrames : supportedMaxFrames;
-          const supportedSecondsNow = Number.isFinite(maxSeconds) ? maxSeconds : supportedMaxSeconds;
-
-          // "Lock" at 5s marks (and 24s for Sora 2 Pro High) when the user is dragging the slider.
-          // Avoid snapping synthetic events fired by our own code (typing in the inputs).
-          if (ev && ev.isTrusted) {
-            const snapped = getSnapFrames(v, { include24s: supportedSecondsNow === 24 });
-            if (snapped != null) {
-              v = snapped;
-              try {
-                if (slider && slider.value !== String(v)) slider.value = String(v);
-              } catch {}
-            }
-          }
-
-          const seconds = framesToSeconds(v);
-          const short = formatSecondsShort(seconds);
-          if (currentEl) currentEl.textContent = short;
-          if (subtextEl) subtextEl.textContent = `${v} frames`;
-
-          const unsupported = v < DURATION_SUPPORTED_MIN_FRAMES || v > supportedFramesNow;
-          if (currentEl) currentEl.dataset.unsupported = unsupported ? '1' : '';
-          if (subtextEl) subtextEl.dataset.unsupported = unsupported ? '1' : '';
-
-          if (document.activeElement !== timeInput && timeInput) timeInput.value = short;
-          if (document.activeElement !== framesInput && framesInput) framesInput.value = String(v);
-        } catch {}
-      });
-      slider.addEventListener('change', (ev) => {
-        try {
-          let v = clampInt(ev?.target?.value, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
-          const maxSeconds = Number(sliderWrap?.dataset?.sctSupportedMaxSeconds || '');
-          const supportedSecondsNow = Number.isFinite(maxSeconds) ? maxSeconds : supportedMaxSeconds;
-
-          if (ev && ev.isTrusted) {
-            const snapped = getSnapFrames(v, { include24s: supportedSecondsNow === 24 });
-            if (snapped != null) v = snapped;
-          }
-
-          // Ensure UI matches the snapped final value.
-          try {
-            if (slider && slider.value !== String(v)) {
-              slider.value = String(v);
-              slider.dispatchEvent(new Event('input'));
-            }
-          } catch {}
-
-          clearInputApplyTimer();
-          applyFrames(v);
-          keepSettingsMenuOpenSoon();
-        } catch {}
-      });
-
-      const commitTime = () => {
-        try {
-          clearInputApplyTimer();
-          const sec = parseTimeToSeconds(timeInput?.value);
-          if (sec == null) return;
-          const frames = secondsToFrames(sec);
-          if (slider) {
-            slider.value = String(frames);
-            slider.dispatchEvent(new Event('input'));
-          }
-          applyFrames(frames);
-          keepSettingsMenuOpenSoon();
-        } catch {}
-      };
-      const commitFrames = () => {
-        try {
-          clearInputApplyTimer();
-          const raw = String(framesInput?.value || '').trim();
-          const n = raw ? Number(raw) : NaN;
-          if (!Number.isFinite(n)) return;
-          const frames = clampInt(n, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
-          if (slider) {
-            slider.value = String(frames);
-            slider.dispatchEvent(new Event('input'));
-          }
-          applyFrames(frames);
-          keepSettingsMenuOpenSoon();
-        } catch {}
-      };
-
-      timeInput.addEventListener('input', () => {
-        try {
-          const sec = parseTimeToSeconds(timeInput?.value);
-          if (sec == null) return;
-          const frames = secondsToFrames(sec);
-          if (slider) {
-            slider.value = String(frames);
-            slider.dispatchEvent(new Event('input'));
-          }
-          scheduleInputApply(frames);
-        } catch {}
-      });
-
-      framesInput.addEventListener('input', () => {
-        try {
-          const raw = String(framesInput?.value || '').trim();
-          const n = raw ? Number(raw) : NaN;
-          if (!Number.isFinite(n)) return;
-          const frames = clampInt(n, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
-          if (slider) {
-            slider.value = String(frames);
-            slider.dispatchEvent(new Event('input'));
-          }
-          scheduleInputApply(frames);
-        } catch {}
-      });
-
-      timeInput.addEventListener('keydown', (ev) => {
-        if ((ev?.key || '') === 'Enter') commitTime();
-      });
-      timeInput.addEventListener('blur', commitTime);
-      framesInput.addEventListener('keydown', (ev) => {
-        if ((ev?.key || '') === 'Enter') commitFrames();
-      });
-      framesInput.addEventListener('blur', commitFrames);
-
-      // Prevent menu close on tap/click.
-      const stop = (ev) => {
-        try {
-          ev.stopPropagation();
-        } catch {}
-      };
-      sliderWrap.addEventListener('click', stop);
-      sliderWrap.addEventListener('pointerdown', stop);
-      sliderWrap.addEventListener('mousedown', stop);
-      sliderWrap.addEventListener('touchstart', stop, { passive: true });
-    } else {
-      slider = sliderWrap.querySelector('input[type="range"][data-sct-duration-range="1"]');
-      currentEl = sliderWrap.querySelector('[data-sct-duration-current="1"]');
-      subtextEl = sliderWrap.querySelector('[data-sct-duration-subtext="1"]');
-      try {
-        sliderWrap.querySelectorAll('[data-sct-duration-ticks="1"]').forEach((el) => el.remove());
-      } catch {}
-      timeInput = sliderWrap.querySelector('input[data-sct-duration-time="1"]');
-      framesInput = sliderWrap.querySelector('input[data-sct-duration-frames="1"]');
-    }
-
-    // Used by event listeners to keep "unsupported" styling correct when settings change.
-    try {
-      sliderWrap.dataset.sctSupportedMaxSeconds = String(supportedMaxSeconds);
-      sliderWrap.dataset.sctSupportedMaxFrames = String(supportedMaxFrames);
-    } catch {}
-
-    // Track background gradient:
-    // - red for 0-5s
-    // - normal for 5s-(supported max)
-    // - red for > supported max
-    try {
-      const denom = DURATION_FRAMES_MAX - DURATION_FRAMES_MIN;
-      const lowBoundaryFrames = Math.min(DURATION_FRAMES_MAX, DURATION_SUPPORTED_MIN_FRAMES);
-      const highBoundaryFrames = Math.min(DURATION_FRAMES_MAX, supportedMaxFrames + 1);
-      const lowPct = denom > 0 ? ((lowBoundaryFrames - DURATION_FRAMES_MIN) / denom) * 100 : 0;
-      const highPct = denom > 0 ? ((highBoundaryFrames - DURATION_FRAMES_MIN) / denom) * 100 : 100;
-      const a = lowPct < 0 ? 0 : lowPct > 100 ? 100 : lowPct;
-      const b = highPct < 0 ? 0 : highPct > 100 ? 100 : highPct;
-      const bg = `linear-gradient(to right, rgba(239, 68, 68, 0.45) 0%, rgba(239, 68, 68, 0.45) ${a}%, rgba(var(--bg-inverse), 0.18) ${a}%, rgba(var(--bg-inverse), 0.18) ${b}%, rgba(239, 68, 68, 0.45) ${b}%, rgba(239, 68, 68, 0.45) 100%)`;
-      if (slider && slider.style) slider.style.setProperty('--sct-duration-track-bg', bg);
-    } catch {}
-
-    // Determine current value: prefer override, otherwise use the selected built-in option.
-    let currentFrames = null;
-    try {
-      const override = getDurationOverride();
-      if (override && Number.isFinite(override.frames)) currentFrames = clampInt(override.frames, DURATION_FRAMES_MIN, DURATION_FRAMES_MAX);
-    } catch {}
-    if (currentFrames == null) {
-      try {
-        const checked = group.querySelector('[role="menuitemradio"][aria-checked="true"]');
-        const sec = getMenuItemSeconds(checked);
-        if (sec != null) currentFrames = secondsToFrames(sec);
-      } catch {}
-    }
-    if (currentFrames == null) currentFrames = DURATION_FRAMES_MIN;
-
-    // Sync UI to current value.
-    try {
-      const seconds = framesToSeconds(currentFrames);
-      const short = formatSecondsShort(seconds);
-      if (slider) slider.value = String(currentFrames);
-      if (currentEl) currentEl.textContent = short;
-      if (subtextEl) subtextEl.textContent = `${currentFrames} frames`;
-      const unsupported = currentFrames < DURATION_SUPPORTED_MIN_FRAMES || currentFrames > supportedMaxFrames;
-      if (currentEl) currentEl.dataset.unsupported = unsupported ? '1' : '';
-      if (subtextEl) subtextEl.dataset.unsupported = unsupported ? '1' : '';
-      if (timeInput && document.activeElement !== timeInput) timeInput.value = short;
-      if (framesInput && document.activeElement !== framesInput) framesInput.value = String(currentFrames);
-    } catch {}
   }
 
   function installDurationDropdownEnhancer() {
@@ -1964,6 +1610,12 @@
         let override = getDurationOverride();
         const settings = getSoraSettings();
         const allow25 = shouldOffer25s(settings);
+
+        // Slider UI removed: discard any persisted custom override from older versions.
+        if (override) {
+          clearDurationOverride();
+          override = null;
+        }
 
         // Normalize override to be frames-first (seconds derived), and keep it within slider bounds.
         try {
@@ -2057,11 +1709,8 @@
           const labelText = (radio.querySelector('span.truncate')?.textContent || radio.textContent || '').trim();
           const m = labelText.match(/(\d+)\s*seconds?/i) || labelText.match(/(\d+)\s*s\b/i);
           const sec = m ? Number(m[1]) : null;
-          if (Number.isFinite(sec)) {
-            writeDurationOverride({ seconds: sec, frames: secondsToFrames(sec) });
-          } else {
-            clearDurationOverride();
-          }
+          // Dropdown restored: don't persist a custom override when using built-in durations.
+          clearDurationOverride();
 
           // Ensure injected items no longer look selected.
           try {

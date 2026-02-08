@@ -517,6 +517,30 @@
   const isPost = () => /^\/p\/s_[A-Za-z0-9]+/i.test(location.pathname);
   const isDraftDetail = () => location.pathname === '/d' || location.pathname.startsWith('/d/');
 
+  const isMobileDevice = () => {
+    try {
+      if (navigator.userAgentData && typeof navigator.userAgentData.mobile === 'boolean') {
+        return navigator.userAgentData.mobile;
+      }
+    } catch {}
+    const ua = String(navigator.userAgent || '');
+    if (/(Android|iPhone|iPad|iPod|Mobile)/i.test(ua)) return true;
+    try {
+      const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+      const noHover = !!(window.matchMedia && window.matchMedia('(hover: none)').matches);
+      const small = !!(window.matchMedia && window.matchMedia('(max-width: 900px)').matches);
+      return coarse && noHover && small;
+    } catch {}
+    return false;
+  };
+
+  const shouldDisableMobilePreviewAutoplay = () => {
+    if (!isMobileDevice()) return false;
+    // Keep post detail behavior intact; only disable preview autoplay on feed/grid-style pages.
+    if (isPost() || isDraftDetail()) return false;
+    return isExplore() || isProfile() || isDrafts();
+  };
+
   const isTopFeed = () => {
     try {
       const u = new URL(location.href);
@@ -919,10 +943,10 @@
   };
 
   // == Video memory management ==
-	  function getOrInitVideoMeta(videoEl) {
-	    let m = null;
-	    try {
-	      m = videoMeta.get(videoEl);
+		  function getOrInitVideoMeta(videoEl) {
+		    let m = null;
+		    try {
+		      m = videoMeta.get(videoEl);
 	    } catch {}
 	    if (m) return m;
 		    m = {
@@ -938,9 +962,25 @@
 		    };
 	    try {
 	      videoMeta.set(videoEl, m);
-	    } catch {}
-	    return m;
-	  }
+		    } catch {}
+		    return m;
+		  }
+
+  function disableMobilePreviewAutoplay(videoEl, meta) {
+    try {
+      if (!videoEl) return;
+      // Best-effort: stop preview videos from auto-playing on mobile to reduce CPU/battery usage.
+      if (!meta) meta = getOrInitVideoMeta(videoEl);
+      meta.autoplayDisabled = true;
+      try { videoEl.autoplay = false; } catch {}
+      try { videoEl.removeAttribute('autoplay'); } catch {}
+      try { videoEl.loop = false; } catch {}
+      try { videoEl.removeAttribute('loop'); } catch {}
+      try { videoEl.pause(); } catch {}
+      try { videoEl.preload = 'none'; } catch {}
+      try { videoEl.setAttribute('preload', 'none'); } catch {}
+    } catch {}
+  }
 
   function videoHasSources(videoEl) {
     try {
@@ -1285,6 +1325,7 @@
 	    videoPurgeLastRunMs = now;
 
 	    const gather = !!isGatheringActiveThisTab;
+	    const disableAutoplay = shouldDisableMobilePreviewAutoplay();
 	    let maxLoaded = gather ? VIDEO_MAX_LOADED_GATHER : VIDEO_MAX_LOADED_NORMAL;
 	    const marginPx = gather ? VIDEO_OFFSCREEN_MARGIN_PX_GATHER : VIDEO_OFFSCREEN_MARGIN_PX_NORMAL;
 	    const ttlMs = gather ? VIDEO_OFFSCREEN_TTL_MS_GATHER : VIDEO_OFFSCREEN_TTL_MS_NORMAL;
@@ -1334,6 +1375,9 @@
 	    for (const v of videos) {
 	      if (!v || !v.isConnected) continue;
 	      const meta = getOrInitVideoMeta(v);
+	      if (disableAutoplay) {
+	        disableMobilePreviewAutoplay(v, meta);
+	      }
 	      const rect = v.getBoundingClientRect ? v.getBoundingClientRect() : null;
 	      const inViewport = isInViewportRect(rect, viewportH);
 	      let hasSrc = videoHasSources(v);
