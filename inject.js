@@ -659,41 +659,100 @@
     return false;
   };
 
-  const shouldDisableMobilePreviewAutoplay = () => {
-    if (!isMobileDevice()) return false;
-    // Keep post detail + draft detail behavior intact; only disable preview autoplay on feed/grid-style pages.
-    if (isPost() || isDraftDetail()) return false;
-    return isExplore() || isProfile() || isDrafts() || isUVDrafts();
-  };
+	  const shouldDisableMobilePreviewAutoplay = () => {
+	    if (!isMobileDevice()) return false;
+	    // Keep post detail + draft detail behavior intact; only disable preview autoplay on feed/grid-style pages.
+	    if (isPost() || isDraftDetail()) return false;
+	    return isExplore() || isProfile() || isDrafts() || isUVDrafts();
+	  };
 
-  const SCT_MOBILE_AUTOPLAY_DISABLED_ATTR = 'data-sct-mobile-noautoplay';
-  const SCT_MOBILE_PLAY_GUARD_ATTR = 'data-sct-mobile-playguard';
-  let sctMobileAutoplayObs = null;
-  let sctMobileAutoplayActive = false;
-  let sctMobileAutoplayScheduled = false;
-  const sctMobileAutoplayPending = new Set();
+	  const SCT_MOBILE_AUTOPLAY_DISABLED_ATTR = 'data-sct-mobile-noautoplay';
+	  const SCT_MOBILE_PLAY_GUARD_ATTR = 'data-sct-mobile-playguard';
+	  const SCT_MOBILE_USERPLAY_TS_ATTR = 'data-sct-mobile-userplay-ts';
+	  const SCT_MOBILE_USERPLAY_WINDOW_MS = 4000;
+	  let sctMobileAutoplayObs = null;
+	  let sctMobileAutoplayActive = false;
+	  let sctMobileAutoplayScheduled = false;
+	  const sctMobileAutoplayPending = new Set();
 
-  let sctMobilePlayPatchInstalled = false;
-  function ensureMobileAutoplayPlayPatch() {
-    if (sctMobilePlayPatchInstalled) return;
-    sctMobilePlayPatchInstalled = true;
-    try {
+	  let sctMobileUserPlayListenerInstalled = false;
+	  function isMobileUserActivationActive() {
+	    try {
+	      // Available in modern browsers; lets us detect a real user gesture.
+	      return !!(navigator.userActivation && navigator.userActivation.isActive);
+	    } catch {}
+	    return false;
+	  }
+
+	  function markMobileUserPlayIntent(videoEl) {
+	    try {
+	      if (!videoEl || videoEl.nodeType !== 1 || videoEl.tagName !== 'VIDEO') return;
+	      videoEl.setAttribute(SCT_MOBILE_USERPLAY_TS_ATTR, String(Date.now()));
+	    } catch {}
+	  }
+
+	  function hasRecentMobileUserPlayIntent(videoEl) {
+	    try {
+	      if (isMobileUserActivationActive()) return true;
+	      if (!videoEl || videoEl.nodeType !== 1 || videoEl.tagName !== 'VIDEO') return false;
+	      const ts = Number(videoEl.getAttribute && videoEl.getAttribute(SCT_MOBILE_USERPLAY_TS_ATTR));
+	      if (!Number.isFinite(ts) || ts <= 0) return false;
+	      return Date.now() - ts <= SCT_MOBILE_USERPLAY_WINDOW_MS;
+	    } catch {}
+	    return false;
+	  }
+
+	  function ensureMobileUserPlayIntentListener() {
+	    if (sctMobileUserPlayListenerInstalled) return;
+	    sctMobileUserPlayListenerInstalled = true;
+	    const handler = (e) => {
+	      try {
+	        if (!shouldDisableMobilePreviewAutoplay()) return;
+	        const t = e && e.target;
+	        if (!t || !t.closest) return;
+	        let v = t.closest('video');
+	        if (!v) {
+	          const card = t.closest('article, [role=\"article\"], a[href^=\"/p/s_\"], a[href^=\"/d/\"]');
+	          v = card && card.querySelector ? card.querySelector('video') : null;
+	        }
+	        if (!v) return;
+	        markMobileUserPlayIntent(v);
+	      } catch {}
+	    };
+	    try {
+	      // Capture so we record intent before app handlers call play().
+	      document.addEventListener('pointerdown', handler, true);
+	      document.addEventListener('touchstart', handler, true);
+	      document.addEventListener('click', handler, true);
+	    } catch {}
+	  }
+
+	  let sctMobilePlayPatchInstalled = false;
+	  function ensureMobileAutoplayPlayPatch() {
+	    if (sctMobilePlayPatchInstalled) return;
+	    sctMobilePlayPatchInstalled = true;
+	    try {
       if (typeof HTMLMediaElement !== 'function' || !HTMLMediaElement.prototype) return;
       const proto = HTMLMediaElement.prototype;
       const origPlay = proto.play;
       if (typeof origPlay !== 'function') return;
-      if (origPlay && origPlay.__sct_patched__) return;
-      proto.play = function () {
-        try {
-          // Only hard-block preview autoplay on mobile feed/grid pages.
-          if (shouldDisableMobilePreviewAutoplay() && this && this.tagName === 'VIDEO') {
-            const v = this;
-            if (v && v.getAttribute && v.hasAttribute(SCT_MOBILE_AUTOPLAY_DISABLED_ATTR)) {
-              try { v.pause(); } catch {}
-              try { v.autoplay = false; } catch {}
-              try { v.removeAttribute('autoplay'); } catch {}
-              const P = typeof Promise === 'function' ? Promise : null;
-              return P ? P.resolve() : undefined;
+	      if (origPlay && origPlay.__sct_patched__) return;
+	      proto.play = function () {
+	        try {
+	          // Only hard-block preview autoplay on mobile feed/grid pages.
+	          if (shouldDisableMobilePreviewAutoplay() && this && this.tagName === 'VIDEO') {
+	            const v = this;
+	            if (
+	              v &&
+	              v.getAttribute &&
+	              v.hasAttribute(SCT_MOBILE_AUTOPLAY_DISABLED_ATTR) &&
+	              !hasRecentMobileUserPlayIntent(v)
+	            ) {
+	              try { v.pause(); } catch {}
+	              try { v.autoplay = false; } catch {}
+	              try { v.removeAttribute('autoplay'); } catch {}
+	              const P = typeof Promise === 'function' ? Promise : null;
+	              return P ? P.resolve() : undefined;
             }
           }
         } catch {}
@@ -705,20 +764,22 @@
     } catch {}
   }
 
-  function installMobileAutoplayPlayGuard(videoEl) {
-    try {
-      if (!videoEl || videoEl.nodeType !== 1 || videoEl.tagName !== 'VIDEO') return;
-      if (videoEl.hasAttribute(SCT_MOBILE_PLAY_GUARD_ATTR)) return;
-      videoEl.setAttribute(SCT_MOBILE_PLAY_GUARD_ATTR, '1');
+	  function installMobileAutoplayPlayGuard(videoEl) {
+	    try {
+	      if (!videoEl || videoEl.nodeType !== 1 || videoEl.tagName !== 'VIDEO') return;
+	      if (videoEl.hasAttribute(SCT_MOBILE_PLAY_GUARD_ATTR)) return;
+	      videoEl.setAttribute(SCT_MOBILE_PLAY_GUARD_ATTR, '1');
 
-      const guard = () => {
-        try {
-          if (!shouldDisableMobilePreviewAutoplay()) return;
-          if (!videoEl.hasAttribute(SCT_MOBILE_AUTOPLAY_DISABLED_ATTR)) return;
-          try { videoEl.pause(); } catch {}
-          try { videoEl.autoplay = false; } catch {}
-          try { videoEl.removeAttribute('autoplay'); } catch {}
-          try { videoEl.loop = false; } catch {}
+	      const guard = () => {
+	        try {
+	          if (!shouldDisableMobilePreviewAutoplay()) return;
+	          if (!videoEl.hasAttribute(SCT_MOBILE_AUTOPLAY_DISABLED_ATTR)) return;
+	          // Allow play when the user explicitly taps/clicks the video.
+	          if (hasRecentMobileUserPlayIntent(videoEl)) return;
+	          try { videoEl.pause(); } catch {}
+	          try { videoEl.autoplay = false; } catch {}
+	          try { videoEl.removeAttribute('autoplay'); } catch {}
+	          try { videoEl.loop = false; } catch {}
           try { videoEl.removeAttribute('loop'); } catch {}
           try { videoEl.preload = 'none'; } catch {}
           try { videoEl.setAttribute('preload', 'none'); } catch {}
@@ -775,24 +836,25 @@
     requestAnimationFrame(processMobileAutoplayNodes);
   }
 
-  function updateMobilePreviewAutoplayDisabler() {
-    const nextActive = shouldDisableMobilePreviewAutoplay();
-    if (!nextActive) {
-      sctMobileAutoplayActive = false;
-      sctMobileAutoplayPending.clear();
+	  function updateMobilePreviewAutoplayDisabler() {
+	    const nextActive = shouldDisableMobilePreviewAutoplay();
+	    if (!nextActive) {
+	      sctMobileAutoplayActive = false;
+	      sctMobileAutoplayPending.clear();
       try {
         if (sctMobileAutoplayObs) sctMobileAutoplayObs.disconnect();
       } catch {}
       sctMobileAutoplayObs = null;
       return;
-    }
+	    }
 
-    sctMobileAutoplayActive = true;
-    try { ensureMobileAutoplayPlayPatch(); } catch {}
-    // Process existing videos once.
-    try {
-      const vids = document.querySelectorAll ? document.querySelectorAll('video') : [];
-      for (const v of vids) disableMobilePreviewAutoplay(v);
+	    sctMobileAutoplayActive = true;
+	    try { ensureMobileUserPlayIntentListener(); } catch {}
+	    try { ensureMobileAutoplayPlayPatch(); } catch {}
+	    // Process existing videos once.
+	    try {
+	      const vids = document.querySelectorAll ? document.querySelectorAll('video') : [];
+	      for (const v of vids) disableMobilePreviewAutoplay(v);
     } catch {}
 
     if (sctMobileAutoplayObs) return;
@@ -3574,64 +3636,102 @@
 
   function makePill(btn, label, hasArrow = false) {
     // inject shared CSS once
-    if (!document.getElementById('sora-uv-btn-style')) {
-      const st = document.createElement('style');
-      st.id = 'sora-uv-btn-style';
-      st.textContent = `
-        .sora-uv-btn {
-          display: flex;
-          height: 40px;
-          align-items: center;
-          justify-content: space-between;
-          gap: 6px;
-          border-radius: 9999px;
-          padding: 0 16px;
-          background: rgba(37, 37, 37, 0.6);
-          backdrop-filter: blur(22px) saturate(2);
-          -webkit-backdrop-filter: blur(22px) saturate(2);
-          border: 1px solid rgba(255, 255, 255, 0.15);
-          color: #fff;
-          font-size: 16px;
-          font-weight: 600;
-          white-space: nowrap;
-          cursor: pointer;
-          user-select: none;
-          transition: opacity 120ms ease;
-          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-        }
-        .sora-uv-btn::before,
-        .sora-uv-btn::after {
-          display: none !important;
-        }
-        .sora-uv-btn:hover {
-          opacity: 0.9;
-        }
-        .sora-uv-btn[disabled] { 
-          opacity: .5; 
-          cursor: not-allowed; 
-        }
-        .sora-uv-btn[data-active="true"] {
-          background: hsla(120, 60%, 30%, .90) !important;
-          border: 1px solid hsla(120, 60%, 40%, .90) !important;
-          box-shadow: 0 0 10px 3px hsla(120, 60%, 35%, .45) !important;
-          color: #fff !important;
-          opacity: 1 !important;
-        }
-        .sora-uv-btn[data-active="true"]:hover {
-          background: hsla(120, 60%, 32%, .95) !important;
-        }
-        .sora-uv-btn svg {
-          opacity: 0.5;
-        }
-        .sora-uv-btn:hover svg {
-          opacity: 1;
-        }
-        .sora-uv-btn[data-active="true"] svg {
-          opacity: 0.8;
-        }
-      `;
-      document.head.appendChild(st);
-    }
+	    if (!document.getElementById('sora-uv-btn-style')) {
+	      const st = document.createElement('style');
+	      st.id = 'sora-uv-btn-style';
+	      st.textContent = `
+	        .sora-uv-btn {
+	          display: flex;
+	          height: 40px;
+	          align-items: center;
+	          justify-content: space-between;
+	          gap: 6px;
+	          border-radius: 9999px;
+	          padding: 0 16px;
+	          background: rgba(37, 37, 37, 0.6);
+	          backdrop-filter: blur(22px) saturate(2);
+	          -webkit-backdrop-filter: blur(22px) saturate(2);
+	          border: 1px solid rgba(255, 255, 255, 0.15);
+	          color: #fff;
+	          font-size: 16px;
+	          font-weight: 600;
+	          white-space: nowrap;
+	          cursor: pointer;
+	          user-select: none;
+	          transition: opacity 120ms ease;
+	          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+	        }
+	        .sora-uv-icon-btn {
+	          display: flex;
+	          width: 40px;
+	          height: 40px;
+	          align-items: center;
+	          justify-content: center;
+	          border-radius: 9999px;
+	          padding: 0;
+	          background: rgba(37, 37, 37, 0.6);
+	          backdrop-filter: blur(22px) saturate(2);
+	          -webkit-backdrop-filter: blur(22px) saturate(2);
+	          border: 1px solid rgba(255, 255, 255, 0.15);
+	          color: #fff;
+	          cursor: pointer;
+	          user-select: none;
+	          transition: opacity 120ms ease;
+	          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+	        }
+	        .sora-uv-btn::before,
+	        .sora-uv-btn::after {
+	          display: none !important;
+	        }
+	        .sora-uv-btn:hover {
+	          opacity: 0.9;
+	        }
+	        .sora-uv-icon-btn:hover {
+	          opacity: 0.9;
+	        }
+	        .sora-uv-btn[disabled] { 
+	          opacity: .5; 
+	          cursor: not-allowed; 
+	        }
+	        .sora-uv-btn[data-active="true"] {
+	          background: hsla(120, 60%, 30%, .90) !important;
+	          border: 1px solid hsla(120, 60%, 40%, .90) !important;
+	          box-shadow: 0 0 10px 3px hsla(120, 60%, 35%, .45) !important;
+	          color: #fff !important;
+	          opacity: 1 !important;
+	        }
+	        .sora-uv-btn[data-active="true"]:hover {
+	          background: hsla(120, 60%, 32%, .95) !important;
+	        }
+	        .sora-uv-btn svg {
+	          opacity: 0.5;
+	        }
+	        .sora-uv-icon-btn svg {
+	          opacity: 0.7;
+	        }
+	        .sora-uv-btn:hover svg {
+	          opacity: 1;
+	        }
+	        .sora-uv-icon-btn:hover svg {
+	          opacity: 1;
+	        }
+	        .sora-uv-btn[data-active="true"] svg {
+	          opacity: 0.8;
+	        }
+	        @media (max-width: 900px) {
+	          .sora-uv-btn {
+	            height: 36px;
+	            padding: 0 12px;
+	            font-size: 14px;
+	          }
+	          .sora-uv-icon-btn {
+	            width: 36px;
+	            height: 36px;
+	          }
+	        }
+	      `;
+	      document.head.appendChild(st);
+	    }
 
     // reset + label
     while (btn.firstChild) btn.removeChild(btn.firstChild);
@@ -3677,14 +3777,15 @@
       makePill(document.createElement('button'), '');
     }
 
-    if (controlBar && document.contains(controlBar)) return controlBar;
+	    if (controlBar && document.contains(controlBar)) return controlBar;
 
-    const bar = document.createElement('div');
-    bar.className = 'sora-uv-controls';
-    
-    // Helper function to calculate top position based on scroll distance
-    // Linear movement: starts at 42px (12px + 30px), moves to 8px over 30px of scroll
-    // Only applies on explore pages
+	    const bar = document.createElement('div');
+	    bar.className = 'sora-uv-controls';
+	    const isMobile = isMobileDevice();
+	    
+	    // Helper function to calculate top position based on scroll distance
+	    // Linear movement: starts at 42px (12px + 30px), moves to 8px over 30px of scroll
+	    // Only applies on explore pages
     const getBarTopPosition = () => {
       // Only apply scroll-based positioning on explore pages
       if (!isExplore()) {
@@ -3713,23 +3814,27 @@
       bar.style.top = getBarTopPosition();
     };
     
-    Object.assign(bar.style, {
-      position: 'fixed',
-      top: getBarTopPosition(), // Start 30px lower (42px), move linearly to 12px
-      right: '12px',
-      zIndex: 2147483640, // Lower than max to allow notifications (toasts) to be on top
-      display: 'flex',
-      gap: '8px',
-      padding: '0',
-      borderRadius: '0',
-      background: 'transparent',
-      color: '#fff',
-      fontSize: '12px',
-      alignItems: 'center',
-      userSelect: 'none',
-      flexDirection: 'column',
-      // No transition - direct movement tied to scroll
-    });
+	    Object.assign(bar.style, {
+	      position: 'fixed',
+	      top: getBarTopPosition(), // Start 30px lower (42px), move linearly to 12px
+	      right: '12px',
+	      zIndex: 2147483640, // Lower than max to allow notifications (toasts) to be on top
+	      display: 'flex',
+	      gap: isMobile ? '6px' : '8px',
+	      padding: '0',
+	      borderRadius: '0',
+	      background: 'transparent',
+	      color: '#fff',
+	      fontSize: '12px',
+	      alignItems: isMobile ? 'flex-end' : 'center',
+	      userSelect: 'none',
+	      flexDirection: 'column',
+	      // No transition - direct movement tied to scroll
+	    });
+	    if (isMobile) {
+	      // Prevent the control bar from overflowing the viewport on small screens.
+	      bar.style.maxWidth = 'calc(100vw - 24px)';
+	    }
     
     // Function to update feed selector button position based on scroll
     const updateFeedButtonPosition = () => {
@@ -3815,14 +3920,18 @@
     // Store the update function on the bar for later use
     bar.updateBarPosition = updateBarPosition;
 
-    const buttonRow = document.createElement('div');
-    Object.assign(buttonRow.style, {
-      display: 'flex',
-      gap: '8px',
-      background: 'transparent',
-      justifyContent: 'center',
-      alignItems: 'center',
-    });
+	    const buttonRow = document.createElement('div');
+	    Object.assign(buttonRow.style, {
+	      display: 'flex',
+	      gap: isMobile ? '6px' : '8px',
+	      background: 'transparent',
+	      justifyContent: isMobile ? 'flex-end' : 'center',
+	      alignItems: 'center',
+	      flexWrap: isMobile ? 'wrap' : 'nowrap',
+	    });
+	    if (isMobile) {
+	      buttonRow.style.maxWidth = 'calc(100vw - 24px)';
+	    }
 
     // prefs
     let prefs = getPrefs();
@@ -4023,13 +4132,84 @@
       });
     };
     
-    // Initialize selection state
-    updateBookmarksDropdownSelection();
-    
-    bookmarksContainer.appendChild(bookmarksDropdown);
-    buttonRow.appendChild(bookmarksContainer);
+	    // Initialize selection state
+	    updateBookmarksDropdownSelection();
+	    
+	    bookmarksContainer.appendChild(bookmarksDropdown);
+	    buttonRow.appendChild(bookmarksContainer);
 
-    bar.appendChild(buttonRow);
+	    // Mobile does not reliably expose the left sidebar icons; add compact Dashboard + UV Drafts buttons here.
+	    if (isMobile) {
+	      const dashboardIconBtn = document.createElement('button');
+	      dashboardIconBtn.type = 'button';
+	      dashboardIconBtn.className = 'sora-uv-icon-btn sora-uv-mobile-menu-btn';
+	      dashboardIconBtn.setAttribute('aria-label', 'Dashboard');
+	      dashboardIconBtn.title = 'Dashboard';
+	      dashboardIconBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" style="pointer-events:none;">
+	        <path d="M4 4V18H20" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+	        <path d="M5 16L9 11L13 14L18 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+	      </svg>`;
+	      dashboardIconBtn.onclick = (e) => {
+	        try {
+	          e.preventDefault();
+	          e.stopPropagation();
+	        } catch {}
+	        let profileHandle = null;
+	        let profileUserKey = null;
+	        // On profile pages, carry the profile handle into the dashboard dropdown (like Analyze).
+	        if (isProfile()) {
+	          profileHandle = currentProfileHandleFromURL();
+	          if (profileHandle) {
+	            profileUserKey = `h:${profileHandle.toLowerCase()}`;
+	            analyzeCameoFilterUsername = profileHandle;
+	            if (analyzeCameoSelectEl) analyzeCameoSelectEl.value = profileHandle;
+	          }
+	        }
+	        try {
+	          window.postMessage(
+	            {
+	              __sora_uv__: true,
+	              type: 'open_dashboard',
+	              userKey: profileUserKey,
+	              userHandle: profileHandle || null,
+	            },
+	            '*'
+	          );
+	        } catch {}
+	      };
+
+	      const uvDraftsIconBtn = document.createElement('button');
+	      uvDraftsIconBtn.type = 'button';
+	      uvDraftsIconBtn.className = 'sora-uv-icon-btn sora-uv-mobile-menu-btn';
+	      uvDraftsIconBtn.setAttribute('aria-label', 'UV Drafts');
+	      uvDraftsIconBtn.title = 'UV Drafts';
+	      uvDraftsIconBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" style="pointer-events:none;">
+	        <rect x="3" y="3" width="7" height="7" rx="1" stroke="currentColor" stroke-width="2"/>
+	        <rect x="14" y="3" width="7" height="7" rx="1" stroke="currentColor" stroke-width="2"/>
+	        <rect x="3" y="14" width="7" height="7" rx="1" stroke="currentColor" stroke-width="2"/>
+	        <rect x="14" y="14" width="7" height="7" rx="1" stroke="currentColor" stroke-width="2"/>
+	      </svg>`;
+	      uvDraftsIconBtn.onclick = (e) => {
+	        try {
+	          e.preventDefault();
+	          e.stopPropagation();
+	        } catch {}
+	        try {
+	          if (uvDraftsPrevDocTitle == null && typeof document.title === 'string' && document.title.trim()) {
+	            uvDraftsPrevDocTitle = document.title;
+	          }
+	        } catch {}
+	        try {
+	          history.pushState({}, '', '/uv-drafts');
+	          onRouteChange();
+	        } catch {}
+	      };
+
+	      buttonRow.appendChild(dashboardIconBtn);
+	      buttonRow.appendChild(uvDraftsIconBtn);
+	    }
+
+	    bar.appendChild(buttonRow);
 
     // Gather controls
     const gatherControlsWrapper = document.createElement('div');
