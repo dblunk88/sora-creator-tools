@@ -465,12 +465,26 @@
           if (onProgress) onProgress(allDrafts.length, pageNum);
         }
 
-        // Handle cursor for pagination
+        // Handle cursor for pagination — trust the cursor, don't cut off based on count
         cursor = data.cursor || data.next_cursor || null;
 
-        // If we got fewer than limit, we're done
-        if (!data.items || data.items.length < 500) {
-          cursor = null;
+        // If response was empty but had a cursor, retry once in case of transient hiccup
+        if (cursor && (!data.items || data.items.length === 0)) {
+          const retryUrl = new URL('https://sora.chatgpt.com/backend/project_y/profile/drafts');
+          retryUrl.searchParams.set('limit', '500');
+          retryUrl.searchParams.set('cursor', cursor);
+          const retryResp = await fetch(retryUrl.toString(), { credentials: 'include', headers });
+          if (retryResp.ok) {
+            const retryData = await retryResp.json();
+            if (retryData.items && Array.isArray(retryData.items)) {
+              allDrafts.push(...retryData.items);
+              pageNum++;
+              if (onProgress) onProgress(allDrafts.length, pageNum);
+            }
+            cursor = retryData.cursor || retryData.next_cursor || null;
+          } else {
+            cursor = null;
+          }
         }
       } catch (err) {
         console.error('[UV Drafts] Fetch error:', err);
@@ -563,13 +577,54 @@
           if (onProgress) onProgress(uvDraftsData.length, pageNum);
 
           if (hadUpdates && uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none') {
-            renderUVDraftsGrid();
+            renderUVDraftsSyncUpdate();
           }
           updateUVDraftsStats();
         }
 
+        // Trust the cursor, don't cut off based on count
         cursor = data.cursor || data.next_cursor || null;
-        if (!data.items || data.items.length < 500) cursor = null;
+
+        // If response was empty but had a cursor, retry once
+        if (cursor && (!data.items || data.items.length === 0)) {
+          if (isStaleRun()) return false;
+          const retryUrl = new URL('https://sora.chatgpt.com/backend/project_y/profile/drafts');
+          retryUrl.searchParams.set('limit', '500');
+          retryUrl.searchParams.set('cursor', cursor);
+          const retryHeaders = { 'accept': '*/*', 'cache-control': 'no-cache' };
+          if (capturedAuthToken) retryHeaders['Authorization'] = capturedAuthToken;
+          const retryResp = await fetch(retryUrl.toString(), { credentials: 'include', headers: retryHeaders });
+          if (!retryResp.ok) {
+            cursor = null;
+          } else {
+            const retryData = await retryResp.json();
+            if (isStaleRun()) return false;
+            cursor = retryData.cursor || retryData.next_cursor || null;
+            if (retryData.items && retryData.items.length > 0) {
+              const existingDrafts2 = await uvDBGetAll(UV_DRAFTS_STORES.drafts);
+              if (isStaleRun()) return false;
+              const existingMap2 = new Map(existingDrafts2.map(d => [d.id, d]));
+              const transformed2 = retryData.items.map((d, idx) =>
+                transformDraftForStorage(d, existingMap2.get(d.id) || {}, { apiOrder: nextOrder + idx, fromDraftsApi: true })
+              );
+              addDraftIdsToSet(transformed2, syncedIds);
+              nextOrder += retryData.items.length;
+              await uvDBPutAll(UV_DRAFTS_STORES.drafts, transformed2);
+              const incomingById2 = new Map(transformed2.map((draft) => [String(draft?.id || ''), draft]));
+              const mergedData2 = (uvDraftsData || []).map((draft) => {
+                const id = String(draft?.id || '');
+                const incoming = incomingById2.get(id);
+                if (!incoming) return draft;
+                incomingById2.delete(id);
+                return incoming;
+              });
+              for (const incoming of incomingById2.values()) mergedData2.push(incoming);
+              uvDraftsData = mergedData2;
+              if (uvDraftsPageEl && uvDraftsPageEl.style.display !== 'none') renderUVDraftsSyncUpdate();
+              updateUVDraftsStats();
+            }
+          }
+        }
       } catch (err) {
         console.error('[UV Drafts] Background sync error:', err);
         syncSucceeded = false;
@@ -3746,6 +3801,15 @@
     }
 
     return card;
+  }
+
+  // Lightweight render for background sync — updates cache and appends new cards
+  // without destroying existing DOM elements (no flicker).
+  function renderUVDraftsSyncUpdate() {
+    if (!uvDraftsGridEl) return;
+    uvDraftsFilteredCache = getRenderableUVDrafts();
+    if (uvDraftsFilteredCache.length === 0) return;
+    renderMoreUVDrafts();
   }
 
   function renderUVDraftsGrid(resetScroll = true) {
