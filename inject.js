@@ -264,9 +264,265 @@
   let processedDraftCardsCount = 0; // Track how many cards are fully processed
   let lastAppliedFilterState = -1; // Track when filter needs re-applying
 
+  // == Video memory management ==
+  // During Gather mode, Sora can accumulate a large number of <video> elements and decoded frames.
+  // We aggressively unload offscreen videos (remove sources + `load()`) to keep tab memory bounded.
+  const VIDEO_PURGE_ENABLED = true;
+  const VIDEO_PURGE_SCAN_THROTTLE_MS_NORMAL = 1600;
+  const VIDEO_PURGE_SCAN_THROTTLE_MS_GATHER = 450;
+  const VIDEO_MAX_LOADED_NORMAL = 24;
+  // Gather is purely for data collection; keep this low to prevent runaway memory growth.
+  const VIDEO_MAX_LOADED_GATHER = 8;
+  const VIDEO_OFFSCREEN_MARGIN_PX_NORMAL = 450;
+  const VIDEO_OFFSCREEN_MARGIN_PX_GATHER = 60;
+  const VIDEO_OFFSCREEN_TTL_MS_NORMAL = 60 * 1000;
+  const VIDEO_OFFSCREEN_TTL_MS_GATHER = 5 * 1000;
+  const VIDEO_RESTORE_COOLDOWN_MS_GATHER = 2500;
+  // IntersectionObserver can retain targets after React unmounts them, causing runaway memory.
+  // We disable it during Gather and keep the restore margin modest.
+  const VIDEO_IO_DISABLE_IN_GATHER = true;
+  const VIDEO_IO_ROOT_MARGIN = '450px 0px 450px 0px';
+  const VIDEO_IO_RESET_INTERVAL_MS = 45 * 1000;
+  // In normal browsing (non-Gather), keep memory bounded while scrolling down by
+  // eagerly purging videos that are far above the viewport.
+  const VIDEO_NORMAL_PURGE_ABOVE_WHILE_SCROLLING_DOWN = true;
+  // In Gather, if the viewport itself contains too many videos, we may need to unload
+  // some edge-of-viewport videos to enforce the cap.
+  const VIDEO_GATHER_EVICT_VISIBLE_WHEN_OVER_CAP = true;
+  const VIDEO_GATHER_VISIBLE_EDGE_BAND_RATIO = 0.22; // unload visible videos near top/bottom edges first
+  const VIDEO_GATHER_VISIBLE_EDGE_BAND_PX_MIN = 140;
+  // In Gather (scrolling down), aggressively purge videos that are above the viewport even
+  // if we're under the cap, since users rarely scroll back up mid-gather.
+  const VIDEO_GATHER_PURGE_ABOVE_ALWAYS = true;
+  const VIDEO_GATHER_PURGE_ABOVE_MIN_PX = 20;
+
+  let videoPurgeLastRunMs = 0;
+  let videoPurgeScheduled = false;
+  let videoPurgeTimerId = null;
+  let videoPurgeLastResult = null;
+  let videoUnloadedTotal = 0;
+  let videoRestoredTotal = 0;
+  let videoBlobRevokeTotal = 0;
+  let videoPurgeLastScrollY = 0;
+  const videoMeta = new WeakMap(); // HTMLVideoElement -> { unloaded, videoSrcAttr, videoCurrentSrc, preloadAttr, sources, lastActiveMs }
+  let videoIo = null;
+  let videoIoLastResetMs = 0;
+
   // Track route to detect same-tab navigation
   const routeKey = () => `${location.pathname}${location.search}`;
   let lastRouteKey = routeKey();
+
+  // == Memory guardrails ==
+  // Keep enough history for active browsing while capping long-lived tab memory growth.
+  const POST_ENTITY_CACHE_MAX = 2500;
+  const DRAFT_ENTITY_CACHE_MAX = 1200;
+  const TASK_CACHE_MAX = 1500;
+  const CHARACTER_CACHE_MAX = 800;
+  const USERNAME_CACHE_MAX = 1200;
+  const POST_DETAIL_TRACK_MAX = 1200;
+
+  const postEntityLru = new Map();
+  const draftEntityLru = new Map();
+  const taskLru = new Map();
+  const characterLru = new Map();
+  const usernameLru = new Map();
+  let lruTick = 0;
+
+  function touchLru(lru, key) {
+    if (!key) return;
+    lruTick += 1;
+    if (lru.has(key)) lru.delete(key);
+    lru.set(key, lruTick);
+  }
+
+  function pruneLru(lru, max, evict, canEvict) {
+    if (!lru || typeof evict !== 'function') return;
+    let attempts = 0;
+    const maxAttempts = Math.max(10, lru.size * 2);
+    while (lru.size > max && attempts < maxAttempts) {
+      attempts += 1;
+      const oldestKey = lru.keys().next().value;
+      if (!oldestKey) break;
+      if (typeof canEvict === 'function' && !canEvict(oldestKey)) {
+        const stamp = lru.get(oldestKey);
+        lru.delete(oldestKey);
+        lru.set(oldestKey, stamp);
+        continue;
+      }
+      lru.delete(oldestKey);
+      evict(oldestKey);
+    }
+  }
+
+  function trimSetOldest(set, max, shouldSkip) {
+    if (!set || set.size <= max) return;
+    let attempts = 0;
+    const maxAttempts = Math.max(10, set.size * 2);
+    while (set.size > max && attempts < maxAttempts) {
+      attempts += 1;
+      const oldest = set.values().next().value;
+      if (!oldest) break;
+      if (typeof shouldSkip === 'function' && shouldSkip(oldest)) {
+        set.delete(oldest);
+        set.add(oldest);
+        continue;
+      }
+      set.delete(oldest);
+    }
+  }
+
+  function isPostIdEvictable(id) {
+    if (!id) return false;
+    if (lockedPostIds.has(id) || pendingPostDetailIds.has(id)) return false;
+    const sid = currentSIdFromURL();
+    if (sid && sid === id) return false;
+    return true;
+  }
+
+  function evictPostEntity(id) {
+    if (!id) return;
+    idToUnique.delete(id);
+    idToLikes.delete(id);
+    idToViews.delete(id);
+    idToComments.delete(id);
+    idToRemixes.delete(id);
+    idToCameos.delete(id);
+    idToMeta.delete(id);
+    idToDuration.delete(id);
+    idToDimensions.delete(id);
+    lockedPostIds.delete(id);
+    processedPostDetailIds.delete(id);
+    pendingPostDetailIds.delete(id);
+  }
+
+  function evictDraftEntity(id) {
+    if (!id) return;
+    idToPrompt.delete(id);
+    idToDownloadUrl.delete(id);
+    idToViolation.delete(id);
+    idToRemixTarget.delete(id);
+    idToRemixTargetDraft.delete(id);
+    idToDuration.delete(id);
+    idToDimensions.delete(id);
+  }
+
+  function evictTaskEntity(taskId) {
+    if (!taskId) return;
+    taskToSourceDraft.delete(taskId);
+    taskToPrompt.delete(taskId);
+  }
+
+  function evictCharacterEntity(userId) {
+    if (!userId) return;
+    charToCameoCount.delete(userId);
+    charToLikesCount.delete(userId);
+    charToCanCameo.delete(userId);
+    charToCreatedAt.delete(userId);
+    charToOriginalIndex.delete(userId);
+    for (const [uname, mappedUserId] of usernameToUserId.entries()) {
+      if (mappedUserId === userId) usernameToUserId.delete(uname);
+    }
+  }
+
+  function evictUsernameEntity(username) {
+    if (!username) return;
+    usernameToUserId.delete(username);
+  }
+
+  function touchPostId(id) {
+    if (!id) return;
+    touchLru(postEntityLru, id);
+    pruneLru(postEntityLru, POST_ENTITY_CACHE_MAX, evictPostEntity, isPostIdEvictable);
+  }
+
+  function touchDraftId(id) {
+    if (!id) return;
+    touchLru(draftEntityLru, id);
+    pruneLru(draftEntityLru, DRAFT_ENTITY_CACHE_MAX, evictDraftEntity);
+  }
+
+  function touchTaskId(taskId) {
+    if (!taskId) return;
+    touchLru(taskLru, taskId);
+    pruneLru(taskLru, TASK_CACHE_MAX, evictTaskEntity);
+  }
+
+  function touchCharacterId(userId) {
+    if (!userId) return;
+    touchLru(characterLru, userId);
+    pruneLru(characterLru, CHARACTER_CACHE_MAX, evictCharacterEntity);
+  }
+
+  function touchUsernameKey(username) {
+    if (!username) return;
+    touchLru(usernameLru, username);
+    pruneLru(usernameLru, USERNAME_CACHE_MAX, evictUsernameEntity);
+  }
+
+  function notePendingPostDetailId(id) {
+    if (!id) return;
+    pendingPostDetailIds.add(id);
+    trimSetOldest(pendingPostDetailIds, POST_DETAIL_TRACK_MAX, (pid) => !isPostIdEvictable(pid));
+  }
+
+  function clearPendingPostDetailId(id) {
+    if (!id) return;
+    pendingPostDetailIds.delete(id);
+  }
+
+  function noteProcessedPostDetailId(id) {
+    if (!id) return;
+    processedPostDetailIds.add(id);
+    trimSetOldest(processedPostDetailIds, POST_DETAIL_TRACK_MAX, (pid) => !isPostIdEvictable(pid));
+  }
+
+  function clearAllInPageCaches() {
+    const maps = [
+      idToUnique,
+      idToLikes,
+      idToViews,
+      idToComments,
+      idToRemixes,
+      idToCameos,
+      idToMeta,
+      idToDuration,
+      idToDimensions,
+      idToPrompt,
+      idToDownloadUrl,
+      idToViolation,
+      idToRemixTarget,
+      idToRemixTargetDraft,
+      taskToSourceDraft,
+      taskToPrompt,
+      charToCameoCount,
+      charToLikesCount,
+      charToCanCameo,
+      charToCreatedAt,
+      usernameToUserId,
+      charToOriginalIndex,
+      postEntityLru,
+      draftEntityLru,
+      taskLru,
+      characterLru,
+      usernameLru,
+    ];
+    for (const map of maps) {
+      try {
+        map.clear();
+      } catch {}
+    }
+    try {
+      lockedPostIds.clear();
+      processedPostDetailIds.clear();
+      pendingPostDetailIds.clear();
+    } catch {}
+    _metricsCache = null;
+    _metricsCacheTs = 0;
+    _metricsCacheUpdatedAt = 0;
+    _metricsCacheWindowHours = null;
+    lruTick = 0;
+    charGlobalIndexCounter = 0;
+  }
 
   // == Utils ==
   const fmt = (n) =>
@@ -870,6 +1126,664 @@
     cachedDraftCardsCount = filtered.length;
     return filtered;
   };
+
+  // == Video memory management ==
+  function getOrInitVideoMeta(videoEl) {
+    let m = null;
+    try {
+      m = videoMeta.get(videoEl);
+    } catch {}
+    if (m) return m;
+    m = {
+      unloaded: false,
+      videoSrcAttr: null,
+      videoCurrentSrc: null,
+      preloadAttr: null,
+      posterAttr: null,
+      sources: null, // [{src,type,media}]
+      lastActiveMs: 0,
+      unloadAtMs: 0,
+      blobRevoked: false,
+    };
+    try {
+      videoMeta.set(videoEl, m);
+    } catch {}
+    return m;
+  }
+
+  function videoHasSources(videoEl) {
+    try {
+      if (!videoEl) return false;
+      if (typeof videoEl.currentSrc === 'string' && videoEl.currentSrc) return true;
+      const attr = videoEl.getAttribute && videoEl.getAttribute('src');
+      if (attr) return true;
+      const srcEl = videoEl.querySelector && videoEl.querySelector('source[src]');
+      return !!srcEl;
+    } catch {
+      return false;
+    }
+  }
+
+  function captureVideoSources(videoEl, meta) {
+    try {
+      if (!videoEl || !meta) return;
+      meta.videoSrcAttr = (videoEl.getAttribute && videoEl.getAttribute('src')) || null;
+      meta.videoCurrentSrc = typeof videoEl.currentSrc === 'string' && videoEl.currentSrc ? videoEl.currentSrc : null;
+      meta.preloadAttr = (videoEl.getAttribute && videoEl.getAttribute('preload')) || null;
+      const srcs = [];
+      const sources = videoEl.querySelectorAll ? Array.from(videoEl.querySelectorAll('source')) : [];
+      for (const s of sources) {
+        const src = (s && s.getAttribute && s.getAttribute('src')) || null;
+        if (!src) continue;
+        const type = (s.getAttribute && s.getAttribute('type')) || null;
+        const media = (s.getAttribute && s.getAttribute('media')) || null;
+        srcs.push({ src, type, media });
+      }
+      meta.sources = srcs.length ? srcs : null;
+    } catch {}
+  }
+
+  function isBlobUrl(u) {
+    return typeof u === 'string' && u.startsWith('blob:');
+  }
+
+  function revokeBlobUrl(u) {
+    try {
+      if (!isBlobUrl(u)) return false;
+      if (typeof URL === 'undefined' || typeof URL.revokeObjectURL !== 'function') return false;
+      URL.revokeObjectURL(u);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function revokeVideoBlobUrls(meta) {
+    if (!meta) return 0;
+    let revoked = 0;
+    if (revokeBlobUrl(meta.videoSrcAttr)) revoked += 1;
+    if (revokeBlobUrl(meta.videoCurrentSrc)) revoked += 1;
+    if (Array.isArray(meta.sources)) {
+      for (const s of meta.sources) {
+        if (revokeBlobUrl(s?.src)) revoked += 1;
+      }
+    }
+    return revoked;
+  }
+
+  function unloadVideoSources(videoEl, meta, reason = '') {
+    try {
+      if (!videoEl || !meta) return false;
+      if (meta.unloaded) return false;
+      if (!videoHasSources(videoEl)) {
+        meta.unloaded = false;
+        return false;
+      }
+
+      captureVideoSources(videoEl, meta);
+      meta.unloaded = true;
+      meta.unloadAtMs = Date.now();
+      meta.blobRevoked = false;
+
+      const gather = !!isGatheringActiveThisTab;
+      const blobRevokeEligible =
+        gather &&
+        typeof reason === 'string' &&
+        (reason.startsWith('gather_above:') ||
+          reason.startsWith('ttl_above:') ||
+          reason.startsWith('cap_above:') ||
+          reason.startsWith('ttl_hidden:') ||
+          reason.startsWith('cap_hidden:'));
+      if (blobRevokeEligible) {
+        // In Gather, old offscreen-above videos are unlikely to be revisited. If Sora uses
+        // blob URLs, revoking them is one of the few reliable ways to free their backing memory.
+        try {
+          const revoked = revokeVideoBlobUrls(meta);
+          if (revoked > 0) meta.blobRevoked = true;
+          if (revoked > 0) videoBlobRevokeTotal += revoked;
+        } catch {}
+      }
+
+      // Posters can also be large decoded images; drop them for unloaded videos.
+      const preservePoster = typeof reason === 'string' && reason.startsWith('gather_visible_cap:');
+      if (!preservePoster) {
+        try {
+          if (meta.posterAttr == null) {
+            const attr = (videoEl.getAttribute && videoEl.getAttribute('poster')) || null;
+            const prop = typeof videoEl.poster === 'string' && videoEl.poster ? videoEl.poster : null;
+            meta.posterAttr = attr || prop || null;
+          }
+        } catch {}
+        try {
+          videoEl.removeAttribute('poster');
+        } catch {}
+        try {
+          videoEl.poster = '';
+        } catch {}
+      }
+
+      try {
+        videoEl.pause();
+      } catch {}
+
+      // Prefer "none" so the browser can drop network + decoded frame buffers.
+      try {
+        videoEl.setAttribute('preload', 'none');
+      } catch {}
+      try {
+        videoEl.preload = 'none';
+      } catch {}
+      try {
+        // Extra safety: drop any MediaStream/MediaSource attachment.
+        videoEl.srcObject = null;
+      } catch {}
+
+      // Clear <source> children first, then the video src.
+      try {
+        const sources = videoEl.querySelectorAll ? Array.from(videoEl.querySelectorAll('source')) : [];
+        for (const s of sources) {
+          try {
+            s.removeAttribute('src');
+          } catch {}
+        }
+      } catch {}
+      try {
+        videoEl.removeAttribute('src');
+      } catch {}
+
+      // Force the media element to drop its current resource.
+      try {
+        videoEl.load();
+      } catch {}
+
+      // Only observe unloaded videos (so we can restore on scroll-back) to avoid
+      // holding references to every video element in long Gather sessions.
+      try {
+        const allowIo = !(VIDEO_IO_DISABLE_IN_GATHER && isGatheringActiveThisTab) && !document.hidden;
+        if (allowIo) {
+          const io = ensureVideoIntersectionObserver();
+          if (io) io.observe(videoEl);
+        }
+      } catch {}
+
+      videoUnloadedTotal += 1;
+      dlog('feed', 'video unloaded', { reason });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function restoreVideoSourcesIfNeeded(videoEl, meta) {
+    try {
+      if (!videoEl || !meta) return false;
+      if (!meta.unloaded) return false;
+      // If React already restored sources, just clear our unloaded flag.
+      if (videoHasSources(videoEl)) {
+        meta.unloaded = false;
+        meta.unloadAtMs = 0;
+        meta.blobRevoked = false;
+        try {
+          if (meta.posterAttr != null) {
+            videoEl.setAttribute('poster', meta.posterAttr);
+            videoEl.poster = meta.posterAttr;
+            meta.posterAttr = null;
+          }
+        } catch {}
+        try {
+          if (videoIo) videoIo.unobserve(videoEl);
+        } catch {}
+        return false;
+      }
+
+      if (meta.blobRevoked) {
+        // We revoked object URLs for this video (Gather above-viewport eviction). Do not attempt to
+        // restore from captured URLs; let React recreate sources if it ever needs to.
+        return false;
+      }
+
+      // Restore poster (helps avoid flicker when sources are restored).
+      try {
+        if (meta.posterAttr != null) {
+          videoEl.setAttribute('poster', meta.posterAttr);
+          videoEl.poster = meta.posterAttr;
+          meta.posterAttr = null;
+        }
+      } catch {}
+
+      // Restore preload first (or clear override).
+      try {
+        if (meta.preloadAttr != null) videoEl.setAttribute('preload', meta.preloadAttr);
+        else videoEl.removeAttribute('preload');
+      } catch {}
+      try {
+        if (meta.preloadAttr != null) videoEl.preload = meta.preloadAttr;
+        else videoEl.preload = 'metadata';
+      } catch {}
+
+      // Restore <source> list if we captured it.
+      if (Array.isArray(meta.sources) && meta.sources.length) {
+        let sources = [];
+        try {
+          sources = videoEl.querySelectorAll ? Array.from(videoEl.querySelectorAll('source')) : [];
+        } catch {
+          sources = [];
+        }
+
+        // If the source count doesn't match, rebuild to avoid partial restore.
+        if (sources.length !== meta.sources.length) {
+          try {
+            for (const s of sources) {
+              try {
+                s.remove();
+              } catch {}
+            }
+          } catch {}
+          sources = [];
+          for (const sd of meta.sources) {
+            try {
+              const s = document.createElement('source');
+              if (sd?.src) s.setAttribute('src', sd.src);
+              if (sd?.type) s.setAttribute('type', sd.type);
+              if (sd?.media) s.setAttribute('media', sd.media);
+              videoEl.appendChild(s);
+              sources.push(s);
+            } catch {}
+          }
+        } else {
+          for (let i = 0; i < sources.length; i++) {
+            const sd = meta.sources[i];
+            const s = sources[i];
+            if (!s || !sd || !sd.src) continue;
+            try {
+              s.setAttribute('src', sd.src);
+            } catch {}
+            try {
+              s.src = sd.src;
+            } catch {}
+          }
+        }
+      }
+
+      // Restore direct src if it existed (or fall back to currentSrc we captured).
+      if (meta.videoSrcAttr) {
+        try {
+          videoEl.setAttribute('src', meta.videoSrcAttr);
+        } catch {}
+        try {
+          videoEl.src = meta.videoSrcAttr;
+        } catch {}
+      } else if (meta.videoCurrentSrc && (!meta.sources || meta.sources.length === 0)) {
+        try {
+          videoEl.setAttribute('src', meta.videoCurrentSrc);
+        } catch {}
+        try {
+          videoEl.src = meta.videoCurrentSrc;
+        } catch {}
+      }
+
+      try {
+        videoEl.load();
+      } catch {}
+
+      meta.unloaded = false;
+      meta.lastActiveMs = Date.now();
+      meta.unloadAtMs = 0;
+      videoRestoredTotal += 1;
+      try {
+        if (videoIo) videoIo.unobserve(videoEl);
+      } catch {}
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function ensureVideoIntersectionObserver() {
+    if (videoIo) return videoIo;
+    try {
+      if (typeof IntersectionObserver !== 'function') return null;
+      // Keep this generous so scroll-back restores before it becomes visible.
+      videoIo = new IntersectionObserver(
+        (entries) => {
+          const now = Date.now();
+          for (const ent of entries || []) {
+            const v = ent && ent.target;
+            if (!v) continue;
+            const meta = getOrInitVideoMeta(v);
+            if (ent.isIntersecting) {
+              meta.lastActiveMs = now;
+              if (meta.unloaded) {
+                restoreVideoSourcesIfNeeded(v, meta);
+              }
+              try {
+                videoIo && videoIo.unobserve(v);
+              } catch {}
+            }
+          }
+        },
+        { root: null, rootMargin: VIDEO_IO_ROOT_MARGIN, threshold: 0.01 }
+      );
+      videoIoLastResetMs = Date.now();
+    } catch {
+      videoIo = null;
+    }
+    return videoIo;
+  }
+
+  function stopVideoPurge() {
+    try {
+      if (videoPurgeTimerId) clearTimeout(videoPurgeTimerId);
+    } catch {}
+    videoPurgeTimerId = null;
+    videoPurgeScheduled = false;
+    try {
+      if (videoIo) videoIo.disconnect();
+    } catch {}
+    videoIo = null;
+  }
+
+  function shouldPurgeVideosNow() {
+    if (!VIDEO_PURGE_ENABLED) return false;
+    if (isDraftDetail()) return false;
+    return isGatheringActiveThisTab || isExplore() || isProfile() || isDrafts() || isPost() || isUVDrafts();
+  }
+
+  function isOffscreenRect(rect, viewportH, marginPx) {
+    if (!rect) return false;
+    // Hidden/zero-sized elements are never visible; treat as offscreen so we can purge.
+    if ((rect.width || 0) < 2 || (rect.height || 0) < 2) return true;
+    return rect.bottom < -marginPx || rect.top > viewportH + marginPx;
+  }
+
+  function isInViewportRect(rect, viewportH) {
+    if (!rect) return false;
+    return rect.bottom > 0 && rect.top < viewportH;
+  }
+
+  function runVideoPurge(reason = 'unknown') {
+    if (!shouldPurgeVideosNow()) return;
+    const now = Date.now();
+    videoPurgeLastRunMs = now;
+
+    const gather = !!isGatheringActiveThisTab;
+    const disableAutoplay = shouldDisableMobilePreviewAutoplay();
+    let maxLoaded = gather ? VIDEO_MAX_LOADED_GATHER : VIDEO_MAX_LOADED_NORMAL;
+    const marginPx = gather ? VIDEO_OFFSCREEN_MARGIN_PX_GATHER : VIDEO_OFFSCREEN_MARGIN_PX_NORMAL;
+    const ttlMs = gather ? VIDEO_OFFSCREEN_TTL_MS_GATHER : VIDEO_OFFSCREEN_TTL_MS_NORMAL;
+
+    const viewportH = window.innerHeight || 0;
+    const scrollY = Number(window.scrollY || window.pageYOffset || 0);
+    const scrollingDown = scrollY >= (videoPurgeLastScrollY || 0);
+    videoPurgeLastScrollY = scrollY;
+
+    // In Gather, IntersectionObserver can retain thousands of old/unmounted targets.
+    // Kill it aggressively to keep memory bounded.
+    if (gather && VIDEO_IO_DISABLE_IN_GATHER && videoIo) {
+      try {
+        videoIo.disconnect();
+      } catch {}
+      videoIo = null;
+    }
+    if (
+      !gather &&
+      videoIo &&
+      VIDEO_IO_RESET_INTERVAL_MS > 0 &&
+      now - (videoIoLastResetMs || 0) > VIDEO_IO_RESET_INTERVAL_MS
+    ) {
+      // Defensive: periodic reset prevents IO from retaining unmounted elements indefinitely.
+      try {
+        videoIo.disconnect();
+      } catch {}
+      videoIo = null;
+      videoIoLastResetMs = now;
+    }
+
+    let videos = [];
+    try {
+      videos = Array.from(document.querySelectorAll('video'));
+    } catch {
+      videos = [];
+    }
+    if (!videos.length) return;
+
+    // Adaptive caps: as the DOM grows (infinite scroll), clamp loaded videos further
+    // to prevent memory runaway.
+    if (gather) {
+      if (videos.length > 80) maxLoaded = Math.min(maxLoaded, 6);
+      if (videos.length > 140) maxLoaded = Math.min(maxLoaded, 4);
+    } else {
+      if (videos.length > 120) maxLoaded = Math.min(maxLoaded, 18);
+      if (videos.length > 240) maxLoaded = Math.min(maxLoaded, 12);
+    }
+
+    let loaded = 0;
+    const above = [];
+    const below = [];
+    const hidden = [];
+    const visibleLoaded = [];
+
+    for (const v of videos) {
+      if (!v || !v.isConnected) continue;
+      const meta = getOrInitVideoMeta(v);
+      if (disableAutoplay) {
+        disableMobilePreviewAutoplay(v);
+      }
+      const rect = v.getBoundingClientRect ? v.getBoundingClientRect() : null;
+      const inViewport = isInViewportRect(rect, viewportH);
+      let hasSrc = videoHasSources(v);
+
+      // If it's in/near the viewport, keep it warm and ensure it can restore.
+      if (inViewport) {
+        meta.lastActiveMs = now;
+        if (meta.unloaded) {
+          // In Gather, we intentionally keep some visible videos unloaded to cap memory.
+          if (!gather || loaded < maxLoaded) {
+            const cooldownActive =
+              gather && meta.unloadAtMs && now - meta.unloadAtMs < VIDEO_RESTORE_COOLDOWN_MS_GATHER;
+            if (!cooldownActive) {
+              if (restoreVideoSourcesIfNeeded(v, meta)) hasSrc = true;
+            }
+          }
+        }
+      }
+
+      if (hasSrc) {
+        loaded += 1;
+        if (inViewport) visibleLoaded.push({ v, rect, meta });
+      }
+
+      if (hasSrc && isOffscreenRect(rect, viewportH, marginPx)) {
+        const isHidden = rect && ((rect.width || 0) < 2 || (rect.height || 0) < 2);
+        if (isHidden) {
+          hidden.push({ v, rect, meta });
+        } else {
+          const isAbove = rect && rect.bottom < -marginPx;
+          (isAbove ? above : below).push({ v, rect, meta });
+        }
+      }
+    }
+
+    let unloaded = 0;
+
+    // Gather-specific: if we're scrolling down, drop anything above the viewport quickly
+    // to avoid accumulating decoded frames for content we will not revisit.
+    if (gather && scrollingDown && VIDEO_GATHER_PURGE_ABOVE_ALWAYS) {
+      for (const c of above) {
+        if (!c || !c.v || !c.meta) continue;
+        const r = c.v.getBoundingClientRect ? c.v.getBoundingClientRect() : c.rect;
+        if (!r) continue;
+        if (r.bottom > -VIDEO_GATHER_PURGE_ABOVE_MIN_PX) continue;
+        if (unloadVideoSources(c.v, c.meta, `gather_above:${reason}`)) {
+          unloaded += 1;
+          loaded = Math.max(0, loaded - 1);
+        }
+      }
+    }
+
+    // Normal browsing: when scrolling down, aggressively purge far-above videos even if under cap.
+    if (!gather && scrollingDown && VIDEO_NORMAL_PURGE_ABOVE_WHILE_SCROLLING_DOWN) {
+      for (const c of above) {
+        if (!c || !c.v || !c.meta) continue;
+        if (unloadVideoSources(c.v, c.meta, `above:${reason}`)) {
+          unloaded += 1;
+          loaded = Math.max(0, loaded - 1);
+        }
+      }
+    }
+
+    // 1) TTL-based purge (drop old offscreen videos even if we're under the cap).
+    const ttlEvictFrom = (list, label) => {
+      for (const c of list || []) {
+        if (!c || !c.v || !c.meta) continue;
+        const last = Number(c.meta.lastActiveMs) || 0;
+        if (last && now - last < ttlMs) continue;
+        if (unloadVideoSources(c.v, c.meta, `ttl_${label}:${reason}`)) {
+          unloaded += 1;
+          loaded = Math.max(0, loaded - 1);
+        }
+      }
+    };
+    ttlEvictFrom(hidden, 'hidden');
+    ttlEvictFrom(above, 'above');
+    ttlEvictFrom(below, 'below');
+
+    // 2) Count-based purge (enforce a hard cap; purge older/above-viewport first).
+    if (loaded > maxLoaded) {
+      const evictFrom = (list, label) => {
+        for (const c of list) {
+          if (loaded <= maxLoaded) break;
+          if (!c || !c.v || !c.meta) continue;
+          // Ensure it's still offscreen; avoid thrash while scrolling.
+          const r = c.v.getBoundingClientRect ? c.v.getBoundingClientRect() : c.rect;
+          if (!isOffscreenRect(r, viewportH, marginPx)) continue;
+          if (unloadVideoSources(c.v, c.meta, `cap_${label}:${reason}`)) {
+            unloaded += 1;
+            loaded = Math.max(0, loaded - 1);
+          }
+        }
+      };
+      // Hidden videos are the least valuable to keep loaded.
+      evictFrom(hidden, 'hidden');
+      evictFrom(above, 'above');
+      evictFrom(below, 'below');
+    }
+
+    // 3) Gather: If the viewport itself contains too many videos, unload edge-of-viewport
+    // videos first to enforce a hard cap. This keeps Gather usable on dense grids.
+    if (gather && VIDEO_GATHER_EVICT_VISIBLE_WHEN_OVER_CAP && loaded > maxLoaded && visibleLoaded.length) {
+      const centerY = viewportH / 2;
+      const edgeBand = Math.max(VIDEO_GATHER_VISIBLE_EDGE_BAND_PX_MIN, viewportH * VIDEO_GATHER_VISIBLE_EDGE_BAND_RATIO);
+      const edgeCandidates = visibleLoaded
+        .filter((c) => {
+          if (!c || !c.v || !c.rect) return false;
+          if (c.v === document.activeElement) return false;
+          try {
+            if (c.v.matches && c.v.matches(':hover')) return false;
+          } catch {}
+          const mid = (c.rect.top + c.rect.bottom) / 2;
+          return mid < edgeBand || mid > viewportH - edgeBand;
+        })
+        .sort((a, b) => {
+          const am = (a.rect.top + a.rect.bottom) / 2;
+          const bm = (b.rect.top + b.rect.bottom) / 2;
+          const ad = Math.abs(am - centerY);
+          const bd = Math.abs(bm - centerY);
+          return bd - ad;
+        });
+      for (const c of edgeCandidates) {
+        if (loaded <= maxLoaded) break;
+        // Re-check it is still in viewport; avoid unload thrash during fast scroll.
+        const r = c.v.getBoundingClientRect ? c.v.getBoundingClientRect() : c.rect;
+        if (!isInViewportRect(r, viewportH)) continue;
+        if (unloadVideoSources(c.v, c.meta, `gather_visible_cap:${reason}`)) {
+          unloaded += 1;
+          loaded = Math.max(0, loaded - 1);
+        }
+      }
+    }
+
+    videoPurgeLastResult = {
+      reason,
+      gather,
+      scrollingDown,
+      maxLoaded,
+      marginPx,
+      ttlMs,
+      totalVideos: videos.length,
+      loadedAfter: loaded,
+      unloadedThisRun: unloaded,
+      at: now,
+    };
+  }
+
+  function scheduleVideoPurge(reason = 'scheduled') {
+    if (!shouldPurgeVideosNow()) return;
+    const now = Date.now();
+    let throttleMs = isGatheringActiveThisTab ? VIDEO_PURGE_SCAN_THROTTLE_MS_GATHER : VIDEO_PURGE_SCAN_THROTTLE_MS_NORMAL;
+    if (!isGatheringActiveThisTab && reason === 'scroll') throttleMs = Math.min(throttleMs, 1200);
+    const waitMs = Math.max(0, throttleMs - (now - videoPurgeLastRunMs));
+    if (videoPurgeScheduled) return;
+    videoPurgeScheduled = true;
+    try {
+      const run = () => {
+        videoPurgeTimerId = null;
+        videoPurgeScheduled = false;
+        runVideoPurge(reason);
+      };
+      const useIdle =
+        typeof requestIdleCallback === 'function' && !isGatheringActiveThisTab && reason !== 'scroll';
+      if (useIdle) {
+        // In normal browsing, prefer idle time to reduce jank.
+        requestIdleCallback(run, { timeout: Math.min(1200, waitMs + 300) });
+      } else {
+        videoPurgeTimerId = setTimeout(run, waitMs);
+      }
+    } catch {}
+  }
+
+  function unloadAllVideosNow(reason = 'all') {
+    if (!shouldPurgeVideosNow()) return;
+    try {
+      if (videoIo) videoIo.disconnect();
+    } catch {}
+    videoIo = null;
+
+    let vids = [];
+    try {
+      vids = Array.from(document.querySelectorAll('video'));
+    } catch {
+      vids = [];
+    }
+    for (const v of vids) {
+      if (!v || !v.isConnected) continue;
+      const meta = getOrInitVideoMeta(v);
+      if (meta.unloaded) continue;
+      if (!videoHasSources(v)) continue;
+      unloadVideoSources(v, meta, `all:${reason}`);
+    }
+  }
+
+  let videoVisibilityPurgeInstalled = false;
+  function installVideoVisibilityPurge() {
+    if (videoVisibilityPurgeInstalled) return;
+    videoVisibilityPurgeInstalled = true;
+    try {
+      document.addEventListener('visibilitychange', () => {
+        try {
+          if (document.hidden) unloadAllVideosNow('hidden');
+          else scheduleVideoPurge('visible');
+        } catch {}
+      });
+    } catch {}
+    try {
+      window.addEventListener('pagehide', () => {
+        try {
+          unloadAllVideosNow('pagehide');
+        } catch {}
+      });
+    } catch {}
+  }
 
   function bestDraftDownloadUrl(item) {
     if (!item || typeof item !== 'object') return null;
@@ -2058,6 +2972,7 @@
       if (metrics?.users) {
         // Helper function to load post data from a post object
         const loadPostData = (post, postId) => {
+          touchPostId(postId);
           const latest = __sorauv_latestSnapshot(post.snapshots);
           if (latest) {
             // Only set values if they're not null/undefined
@@ -2240,7 +3155,7 @@
   async function fetchPostDetailOnce(sid) {
     if (!sid) return;
     if (processedPostDetailIds.has(sid) || pendingPostDetailIds.has(sid)) return;
-    pendingPostDetailIds.add(sid);
+    notePendingPostDetailId(sid);
     try {
       const urls = buildPostDetailUrls(sid);
       for (const url of urls) {
@@ -2259,7 +3174,7 @@
         } catch {}
       }
     } finally {
-      pendingPostDetailIds.delete(sid);
+      clearPendingPostDetailId(sid);
     }
   }
 
@@ -2288,6 +3203,7 @@
       el.innerHTML = '';
       return;
     }
+    touchPostId(sid);
     
     dlog('feed', 'renderDetailBadge for post', { 
       sid, 
@@ -2815,6 +3731,9 @@
     const handleScroll = () => {
       updateBarPosition();
       updateFeedButtonPosition();
+      try {
+        scheduleVideoPurge('scroll');
+      } catch {}
     };
     window.addEventListener('scroll', handleScroll, { passive: true });
     bar._handleScroll = handleScroll;
@@ -4978,6 +5897,12 @@ async function renderAnalyzeTable(force = false) {
     } else {
       gatherTimerEl.textContent = '';
     }
+
+    // Gather mode is the biggest memory risk: keep the number of loaded videos bounded.
+    // Throttled internally.
+    try {
+      scheduleVideoPurge('gather_tick');
+    } catch {}
   }
 
   function startGathering(forceNewDeadline = false) {
@@ -5555,6 +6480,7 @@ async function renderAnalyzeTable(force = false) {
         ];
         if (refs.some((r) => typeof r === 'string' && r === id)) continue;
       }
+      touchPostId(id);
 
       const uv = getUniqueViews(it);
       const likes = getLikes(it);
@@ -5763,6 +6689,7 @@ async function renderAnalyzeTable(force = false) {
         for (const remixItem of remixPosts) {
           const remixId = getItemId(remixItem);
           if (!remixId) continue;
+          touchPostId(remixId);
           
           // Extract all the same data for the remix post
           const remixUv = getUniqueViews(remixItem);
@@ -5938,8 +6865,9 @@ async function renderAnalyzeTable(force = false) {
         
         // Lock this post's data only if it matches the currently viewed post
         if (isCurrentPost) {
+          touchPostId(mainPostId);
           lockedPostIds.add(mainPostId);
-          processedPostDetailIds.add(mainPostId);
+          noteProcessedPostDetailId(mainPostId);
           
           dlog('feed', 'processed and LOCKED current main post', { 
             id: mainPostId, 
@@ -6017,6 +6945,7 @@ async function renderAnalyzeTable(force = false) {
         if (!looksLikePendingV2Task(task)) continue;
         const taskId = task?.id;
         const taskPrompt = typeof task?.prompt === 'string' ? task.prompt : null;
+        if (taskId) touchTaskId(taskId);
         if (taskId && taskPrompt) taskToPrompt.set(taskId, taskPrompt);
 
         const taskGens = Array.isArray(task?.generations) ? task.generations : [];
@@ -6062,6 +6991,7 @@ async function renderAnalyzeTable(force = false) {
         let draftId = item?.id || item?.generation_id || item?.draft_id;
         if (!draftId) continue;
         draftId = normalizeId(draftId);
+        touchDraftId(draftId);
 
         // Extract n_frames and fps from creation_config for duration
         const nFrames = item?.creation_config?.n_frames;
@@ -6078,6 +7008,7 @@ async function renderAnalyzeTable(force = false) {
 
         // Extract prompt from creation_config
         const taskIdForPrompt = item?.task_id;
+        if (taskIdForPrompt) touchTaskId(taskIdForPrompt);
         const prompt =
           (typeof item?.creation_config?.prompt === 'string' && item.creation_config.prompt) ||
           (typeof item?.prompt === 'string' && item.prompt) ||
@@ -6106,6 +7037,7 @@ async function renderAnalyzeTable(force = false) {
         // Check if this draft is a remix of another draft (only if not already mapped)
         if (!idToRemixTargetDraft.has(draftId)) {
           const taskId = item?.task_id;
+          if (taskId) touchTaskId(taskId);
           if (taskId && taskToSourceDraft.has(taskId)) {
             const sourceDraftId = taskToSourceDraft.get(taskId);
             idToRemixTargetDraft.set(draftId, sourceDraftId);
@@ -6148,11 +7080,14 @@ async function renderAnalyzeTable(force = false) {
         const userId = item?.user_id;
         const username = item?.username;
         if (!userId) continue;
+        touchCharacterId(userId);
         const isCharacter = typeof userId === 'string' && userId.startsWith('ch_');
 
         // Store username -> userId mapping
         if (username) {
-          usernameToUserId.set(username.toLowerCase(), userId);
+          const uname = username.toLowerCase();
+          usernameToUserId.set(uname, userId);
+          touchUsernameKey(uname);
         }
 
         // Store original index for date sorting (only if not already stored)
@@ -6776,6 +7711,9 @@ async function renderAnalyzeTable(force = false) {
     if (location.pathname.includes('/profile')) renderCharacterStats();
     updateControlsVisibility();
     scheduleInjectDashboardButton();
+    try {
+      scheduleVideoPurge('render_pass');
+    } catch {}
   }
 
   const mo = new MutationObserver(() => {
@@ -6833,6 +7771,9 @@ async function renderAnalyzeTable(force = false) {
       if (mo._raf) cancelAnimationFrame(mo._raf);
     } catch {}
     mo._raf = null;
+    try {
+      stopVideoPurge();
+    } catch {}
   }
 
   function resetFilterFreshSlate() {
@@ -7093,6 +8034,10 @@ async function renderAnalyzeTable(force = false) {
         if (dashboardInjectRetryId) clearTimeout(dashboardInjectRetryId);
       } catch {}
       dashboardInjectRetryId = null;
+      // Release large in-page maps while on draft-detail routes.
+      try {
+        clearAllInPageCaches();
+      } catch {}
       scheduleInjectDashboardButton();
       return;
     } else if (!observersActive) {
@@ -7205,6 +8150,7 @@ async function renderAnalyzeTable(force = false) {
     try {
       const data = JSON.parse(localStorage.getItem(TASK_TO_DRAFT_KEY) || '{}');
       for (const [taskId, sourceDraftId] of Object.entries(data)) {
+        touchTaskId(taskId);
         taskToSourceDraft.set(taskId, sourceDraftId);
       }
     } catch {
@@ -7212,6 +8158,7 @@ async function renderAnalyzeTable(force = false) {
     }
   }
   function saveTaskToSourceDraft(taskId, sourceDraftId) {
+    touchTaskId(taskId);
     taskToSourceDraft.set(taskId, sourceDraftId);
     try {
       const data = JSON.parse(localStorage.getItem(TASK_TO_DRAFT_KEY) || '{}');
@@ -7472,6 +8419,9 @@ async function renderAnalyzeTable(force = false) {
     ensureToastStyles();
     try {
       updateMobilePreviewAutoplayDisabler();
+    } catch {}
+    try {
+      installVideoVisibilityPurge();
     } catch {}
     if (isDraftDetail()) {
       dlog('feed', 'draft detail route detected; injecting dashboard only');
