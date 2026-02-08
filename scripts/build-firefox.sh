@@ -18,6 +18,8 @@ cp "$ROOT/dashboard.html" "$OUT_DIR/dashboard.html"
 cp "$ROOT/dashboard.js" "$OUT_DIR/dashboard.js"
 cp "$ROOT/inject.js" "$OUT_DIR/inject.js"
 cp "$ROOT/theme.js" "$OUT_DIR/theme.js"
+cp "$ROOT/uv-drafts-logic.js" "$OUT_DIR/uv-drafts-logic.js"
+cp "$ROOT/uv-drafts-page.js" "$OUT_DIR/uv-drafts-page.js"
 
 cp "$ROOT/manifest.firefox.json" "$OUT_DIR/manifest.json"
 
@@ -33,3 +35,4 @@ popd >/dev/null
 echo "Built:"
 echo "  $ZIP_OUT"
 echo "  $XPI_OUT"
+

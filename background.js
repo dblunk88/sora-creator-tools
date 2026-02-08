@@ -1,7 +1,7 @@
 /*
  * Cross-browser background worker:
  * - Chrome MV3: uses `chrome.*` in a service worker
- * - Firefox: use a MV2 build (see README) or map `browser.*` to the same code shape
+ * - Firefox: use the MV2 build (see scripts/build-firefox.sh)
  *
  * Important: don't declare a top-level `const chrome = ...` because `chrome` is already a
  * host-defined global in extension contexts (SyntaxError: already declared).
@@ -18,7 +18,7 @@
     });
   }
 
-  /* Listen for dashboard open requests from content script */
+  // Listen for dashboard open requests from content script.
   if (ext?.runtime?.onMessage) {
     ext.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (!message || message.action !== 'open_dashboard') return false;
@@ -56,3 +56,4 @@
     });
   }
 })();
+
