@@ -26,25 +26,51 @@
       try {
         const raw = localStorage.getItem(BOOKMARKS_KEY);
         if (!raw) return new Set();
-        const arr = JSON.parse(raw);
-        return new Set(Array.isArray(arr) ? arr : []);
+        const data = JSON.parse(raw);
+        // Support both formats: { ids: [...] } (inject.js) and [...] (legacy)
+        const arr = Array.isArray(data) ? data : (Array.isArray(data?.ids) ? data.ids : []);
+        return new Set(arr);
       } catch {
         return new Set();
       }
+    }
+
+    function setBookmarks(bookmarksSet) {
+      // Safety: independently count bookmark IDs in raw storage to prevent
+      // format-mismatch bugs from silently wiping all bookmarks on write.
+      const raw = localStorage.getItem(BOOKMARKS_KEY);
+      if (raw) {
+        let rawCount = 0;
+        try {
+          const data = JSON.parse(raw);
+          if (Array.isArray(data)) rawCount = data.length;
+          else if (data && typeof data === 'object') {
+            for (const val of Object.values(data)) {
+              if (Array.isArray(val) && val.length > rawCount) rawCount = val.length;
+            }
+          }
+        } catch {}
+        if (rawCount > 1 && bookmarksSet.size < rawCount - 1) {
+          console.error('[UV Drafts] Bookmark safety: blocked write of', bookmarksSet.size,
+            'bookmarks when storage has', rawCount, '. Potential data loss prevented.');
+          return;
+        }
+      }
+      localStorage.setItem(BOOKMARKS_KEY, JSON.stringify({ ids: [...bookmarksSet] }));
     }
 
     function toggleBookmark(draftId) {
       const bookmarks = getBookmarks();
       if (bookmarks.has(draftId)) bookmarks.delete(draftId);
       else bookmarks.add(draftId);
-      localStorage.setItem(BOOKMARKS_KEY, JSON.stringify([...bookmarks]));
+      setBookmarks(bookmarks);
       return bookmarks.has(draftId);
     }
 
     function removeBookmark(draftId) {
       const bookmarks = getBookmarks();
       bookmarks.delete(draftId);
-      localStorage.setItem(BOOKMARKS_KEY, JSON.stringify([...bookmarks]));
+      setBookmarks(bookmarks);
       return false;
     }
 
@@ -809,6 +835,13 @@
       });
 
       if (!res.ok) {
+        // 400 = server rejected it, won't succeed on retry — accept local mark and move on
+        if (res.status === 400) {
+          console.warn('[UV Drafts] Server returned 400 for mark-read, accepting local state:', draftId);
+          uvDraftsUnsyncedReads.delete(draftId);
+          onReadSyncDelivered(draftId);
+          return;
+        }
         throw new Error(`HTTP ${res.status}`);
       }
 
@@ -863,6 +896,11 @@
         if (res.ok) {
           uvDraftsUnsyncedReads.delete(draftId);
           console.log('[UV Drafts] Retry succeeded for:', draftId);
+          onReadSyncDelivered(draftId);
+        } else if (res.status === 400) {
+          // 400 = server won't accept it, stop retrying
+          uvDraftsUnsyncedReads.delete(draftId);
+          console.warn('[UV Drafts] Retry got 400, giving up for:', draftId);
           onReadSyncDelivered(draftId);
         }
       } catch (err) {
@@ -2912,6 +2950,30 @@
     const bookmarks = getBookmarks();
     const skipSort = !!options?.skipSort;
 
+    // DEBUG: bookmark diagnostics
+    const _bmIds = [...bookmarks];
+    const _draftIds = new Set(filtered.map(d => d?.id).filter(Boolean));
+    const _bmInData = _bmIds.filter(id => _draftIds.has(id));
+    const _bmMissing = _bmIds.filter(id => !_draftIds.has(id));
+    const _bmUnsynced = _bmIds.filter(id => {
+      const d = filtered.find(x => x?.id === id);
+      return d?.is_unsynced === true;
+    });
+    console.log('[UV Drafts DEBUG] filterState:', uvDraftsFilterState,
+      '| bookmarks in storage:', _bmIds.length,
+      '| drafts in data:', filtered.length,
+      '| found in data:', _bmInData.length,
+      '| missing from data:', _bmMissing.length,
+      '| unsynced:', _bmUnsynced.length);
+    if (_bmIds.length > 0) {
+      console.log('[UV Drafts DEBUG] bookmark IDs:', _bmIds);
+    }
+    if (_bmMissing.length > 0) {
+      console.log('[UV Drafts DEBUG] missing IDs:', _bmMissing);
+    }
+    // Also log raw localStorage value for format check
+    console.log('[UV Drafts DEBUG] raw localStorage:', localStorage.getItem(BOOKMARKS_KEY));
+
     // Apply search filter
     if (uvDraftsSearchQuery) {
       const parsed = parseSearchTerms(uvDraftsSearchQuery);
@@ -2938,8 +3000,11 @@
     }
 
     // Unsynced cards are archived by default and only shown in the dedicated filter.
+    // Exception: bookmarked items survive when viewing the bookmarked filter.
     if (uvDraftsFilterState === 'unsynced') {
       filtered = filtered.filter((d) => d?.is_unsynced === true);
+    } else if (uvDraftsFilterState === 'bookmarked') {
+      filtered = filtered.filter((d) => d?.is_unsynced !== true || bookmarks.has(d.id));
     } else {
       filtered = filtered.filter((d) => d?.is_unsynced !== true);
     }
@@ -2947,17 +3012,15 @@
     // Apply state filter (but always include "new" drafts when filtering by bookmarked)
     if (uvDraftsFilterState === 'bookmarked') {
       filtered = filtered.filter(d => {
-        // Show if bookmarked OR if it's a new draft (server says unread and not just-marked in this session)
-        const isNew = isDraftUnreadState(d) && !uvDraftsJustSeenIds.has(d.id);
+        const isNew = d?.is_unsynced !== true && isDraftUnreadState(d) && !uvDraftsJustSeenIds.has(d.id);
         return bookmarks.has(d.id) || isNew;
       });
     } else if (uvDraftsFilterState === 'hidden') {
-      filtered = filtered.filter(d => d.hidden);
+      filtered = filtered.filter(d => d?.is_unsynced !== true && d.hidden);
     } else if (uvDraftsFilterState === 'violations') {
-      filtered = filtered.filter(d => isContentViolationDraft(d) || isContextViolationDraft(d));
+      filtered = filtered.filter(d => d?.is_unsynced !== true && (isContentViolationDraft(d) || isContextViolationDraft(d)));
     } else if (uvDraftsFilterState === 'new') {
-      // Show only drafts that server says are unread (is_read must be explicitly false)
-      filtered = filtered.filter(d => isDraftUnreadState(d) && !uvDraftsJustSeenIds.has(d.id));
+      filtered = filtered.filter(d => d?.is_unsynced !== true && isDraftUnreadState(d) && !uvDraftsJustSeenIds.has(d.id));
     } else if (uvDraftsFilterState === 'unsynced') {
       // Already handled above.
     }
@@ -4556,6 +4619,38 @@
       renderUVDraftsGrid();
     });
     filterBar.appendChild(sortSelect);
+
+    // "Remove All Unsynced" button — only visible when unsynced filter is active
+    const removeUnsyncedBtn = document.createElement('button');
+    removeUnsyncedBtn.className = 'uvd-cta';
+    removeUnsyncedBtn.textContent = 'Remove All Unsynced';
+    removeUnsyncedBtn.style.display = uvDraftsFilterState === 'unsynced' ? '' : 'none';
+    removeUnsyncedBtn.style.marginLeft = 'auto';
+    removeUnsyncedBtn.addEventListener('click', async () => {
+      const unsyncedDrafts = uvDraftsData.filter(d => d?.is_unsynced === true);
+      if (unsyncedDrafts.length === 0) return;
+      if (!confirm(`Remove ${unsyncedDrafts.length} unsynced draft${unsyncedDrafts.length === 1 ? '' : 's'} from local storage?\n\nThis only removes them locally — nothing is deleted from the server.`)) return;
+      removeUnsyncedBtn.disabled = true;
+      removeUnsyncedBtn.textContent = 'Removing...';
+      try {
+        for (const draft of unsyncedDrafts) {
+          await uvDBDelete(UV_DRAFTS_STORES.drafts, draft.id);
+        }
+        uvDraftsData = uvDraftsData.filter(d => d?.is_unsynced !== true);
+        renderUVDraftsGrid();
+        updateUVDraftsStats();
+      } catch (err) {
+        console.error('[UV Drafts] Failed to remove unsynced drafts:', err);
+      }
+      removeUnsyncedBtn.disabled = false;
+      removeUnsyncedBtn.textContent = 'Remove All Unsynced';
+    });
+    filterBar.appendChild(removeUnsyncedBtn);
+
+    // Show/hide the remove button when filter changes
+    filterSelect.addEventListener('change', () => {
+      removeUnsyncedBtn.style.display = filterSelect.value === 'unsynced' ? '' : 'none';
+    });
 
     mainPanel.appendChild(filterBar);
     uvDraftsFilterBarEl = filterBar;
