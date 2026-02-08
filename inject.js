@@ -621,7 +621,8 @@
   const normalizeId = (s) => s?.toString().split(/[?#]/)[0].trim();
   const isExplore = () => location.pathname.startsWith('/explore');
   const isProfile = () => location.pathname.startsWith('/profile');
-  const isPost = () => /^\/p\/s_[A-Za-z0-9]+/i.test(location.pathname);
+  // Sora post ids appear as `s_...` and may include URL-safe base64 characters (`-` / `_`).
+  const isPost = () => /^\/p\/s_[^\/]+/i.test(location.pathname);
   const isDraftDetail = () => location.pathname === '/d' || location.pathname.startsWith('/d/');
   const isUVDrafts = () => location.pathname === '/uv-drafts' || location.pathname.startsWith('/uv-drafts');
 
@@ -669,11 +670,13 @@
 	  const SCT_MOBILE_AUTOPLAY_DISABLED_ATTR = 'data-sct-mobile-noautoplay';
 	  const SCT_MOBILE_PLAY_GUARD_ATTR = 'data-sct-mobile-playguard';
 	  const SCT_MOBILE_USERPLAY_TS_ATTR = 'data-sct-mobile-userplay-ts';
-	  const SCT_MOBILE_USERPLAY_WINDOW_MS = 4000;
+	  const SCT_MOBILE_GLOBAL_USER_INTENT_WINDOW_MS = 1500;
+	  const SCT_MOBILE_VIDEO_USER_INTENT_WINDOW_MS = 60000;
 	  let sctMobileAutoplayObs = null;
 	  let sctMobileAutoplayActive = false;
 	  let sctMobileAutoplayScheduled = false;
 	  const sctMobileAutoplayPending = new Set();
+	  let sctMobileGlobalUserIntentMs = 0;
 
 	  let sctMobileUserPlayListenerInstalled = false;
 	  function isMobileUserActivationActive() {
@@ -694,10 +697,16 @@
 	  function hasRecentMobileUserPlayIntent(videoEl) {
 	    try {
 	      if (isMobileUserActivationActive()) return true;
+	      if (
+	        sctMobileGlobalUserIntentMs &&
+	        Date.now() - sctMobileGlobalUserIntentMs <= SCT_MOBILE_GLOBAL_USER_INTENT_WINDOW_MS
+	      ) {
+	        return true;
+	      }
 	      if (!videoEl || videoEl.nodeType !== 1 || videoEl.tagName !== 'VIDEO') return false;
 	      const ts = Number(videoEl.getAttribute && videoEl.getAttribute(SCT_MOBILE_USERPLAY_TS_ATTR));
 	      if (!Number.isFinite(ts) || ts <= 0) return false;
-	      return Date.now() - ts <= SCT_MOBILE_USERPLAY_WINDOW_MS;
+	      return Date.now() - ts <= SCT_MOBILE_VIDEO_USER_INTENT_WINDOW_MS;
 	    } catch {}
 	    return false;
 	  }
@@ -710,11 +719,15 @@
 	        if (!shouldDisableMobilePreviewAutoplay()) return;
 	        const t = e && e.target;
 	        if (!t || !t.closest) return;
+	        let setGlobal = false;
 	        let v = t.closest('video');
 	        if (!v) {
 	          const card = t.closest('article, [role=\"article\"], a[href^=\"/p/s_\"], a[href^=\"/d/\"]');
+	          if (card) setGlobal = true;
 	          v = card && card.querySelector ? card.querySelector('video') : null;
 	        }
+	        if (v) setGlobal = true;
+	        if (setGlobal) sctMobileGlobalUserIntentMs = Date.now();
 	        if (!v) return;
 	        markMobileUserPlayIntent(v);
 	      } catch {}
@@ -737,27 +750,24 @@
       const origPlay = proto.play;
       if (typeof origPlay !== 'function') return;
 	      if (origPlay && origPlay.__sct_patched__) return;
-	      proto.play = function () {
-	        try {
-	          // Only hard-block preview autoplay on mobile feed/grid pages.
-	          if (shouldDisableMobilePreviewAutoplay() && this && this.tagName === 'VIDEO') {
-	            const v = this;
-	            if (
-	              v &&
-	              v.getAttribute &&
-	              v.hasAttribute(SCT_MOBILE_AUTOPLAY_DISABLED_ATTR) &&
-	              !hasRecentMobileUserPlayIntent(v)
-	            ) {
-	              try { v.pause(); } catch {}
-	              try { v.autoplay = false; } catch {}
-	              try { v.removeAttribute('autoplay'); } catch {}
-	              const P = typeof Promise === 'function' ? Promise : null;
-	              return P ? P.resolve() : undefined;
-            }
-          }
-        } catch {}
-        return origPlay.apply(this, arguments);
-      };
+		      proto.play = function () {
+		        try {
+		          // Hard-block preview autoplay on mobile feed/grid pages (esp. Firefox mobile),
+		          // but allow explicit user-initiated playback.
+		          if (shouldDisableMobilePreviewAutoplay() && this && this.tagName === 'VIDEO') {
+		            const v = this;
+		            if (!hasRecentMobileUserPlayIntent(v)) {
+		              try { disableMobilePreviewAutoplay(v); } catch {}
+		              const P = typeof Promise === 'function' ? Promise : null;
+		              return P ? P.resolve() : undefined;
+		            }
+		            // Ensure the intended video stays allowed even if playback is async-delayed
+		            // and the short global-intent window expires.
+		            try { markMobileUserPlayIntent(v); } catch {}
+		          }
+		        } catch {}
+		        return origPlay.apply(this, arguments);
+		      };
       try {
         proto.play.__sct_patched__ = true;
       } catch {}
@@ -887,7 +897,7 @@
   }
 
   function currentSIdFromURL() {
-    const m = location.pathname.match(/^\/p\/(s_[A-Za-z0-9]+)/i);
+    const m = location.pathname.match(/^\/p\/(s_[^\/]+)/i);
     return m ? m[1] : null;
   }
   function currentProfileHandleFromURL() {
@@ -1085,7 +1095,7 @@
   };
   const getItemId = (item) => {
     const cand = item?.post?.id || item?.post?.core_id || item?.post?.content_id || item?.id;
-    if (cand && /^s_[A-Za-z0-9]+$/i.test(cand)) return normalizeId(cand);
+    if (cand && /^s_[A-Za-z0-9_-]+$/i.test(cand)) return normalizeId(cand);
 
     // Guard against comment/reply objects: they often carry a parent/root post id
     // (s_...) plus text, but are not posts themselves. Deep search would otherwise
@@ -1101,8 +1111,8 @@
         item?.parent_post_id ||
         item?.root_post_id ||
         null;
-      const hasOwnSId = typeof ownId === 'string' && /^s_[A-Za-z0-9]+$/i.test(ownId);
-      const hasRefSId = typeof refId === 'string' && /^s_[A-Za-z0-9]+$/i.test(refId);
+      const hasOwnSId = typeof ownId === 'string' && /^s_[A-Za-z0-9_-]+$/i.test(ownId);
+      const hasRefSId = typeof refId === 'string' && /^s_[A-Za-z0-9_-]+$/i.test(refId);
       const hasMediaOrMetrics =
         (Array.isArray(p?.attachments) && p.attachments.length > 0) ||
         typeof p?.preview_image_url === 'string' ||
@@ -1117,7 +1127,7 @@
     try {
       const p = item?.post ?? item ?? {};
       const ownId = p?.id || item?.id || null;
-      const hasOwnSId = typeof ownId === 'string' && /^s_[A-Za-z0-9]+$/i.test(ownId);
+      const hasOwnSId = typeof ownId === 'string' && /^s_[A-Za-z0-9_-]+$/i.test(ownId);
       if (!hasOwnSId) {
         const refs = [
           p?.post_id,
@@ -1142,7 +1152,7 @@
       while (stack.length) {
         const cur = stack.pop();
         if (!cur) continue;
-        if (typeof cur === 'string' && /^s_[A-Za-z0-9]+$/i.test(cur)) return cur;
+        if (typeof cur === 'string' && /^s_[A-Za-z0-9_-]+$/i.test(cur)) return cur;
         if (Array.isArray(cur)) stack.push(...cur);
         else if (typeof cur === 'object') stack.push(...Object.values(cur));
       }
@@ -1152,7 +1162,7 @@
   const extractIdFromCard = (el) => {
     const link = el.querySelector('a[href^="/p/s_"]');
     if (!link) return null;
-    const m = link.getAttribute('href').match(/\/p\/(s_[A-Za-z0-9]+)/i);
+    const m = link.getAttribute('href').match(/\/p\/(s_[A-Za-z0-9_-]+)/i);
     return m ? normalizeId(m[1]) : null;
   };
   function isBadCardContainer(el) {
@@ -3266,7 +3276,7 @@
   function rememberPostDetailTemplate(url) {
     if (typeof url !== 'string') return;
     try {
-      const m = url.match(/\/posts?\/(s_[A-Za-z0-9]+)/i);
+      const m = url.match(/\/posts?\/(s_[A-Za-z0-9_-]+)/i);
       if (!m) return;
       const id = m[1];
       lastPostDetailUrlTemplate = url.replace(id, '{sid}');
@@ -6294,7 +6304,7 @@ async function renderAnalyzeTable(force = false) {
       for (let i = 0; i < Math.min(items.length, 10); i++) {
         const it = items[i],
           p = it?.post || it || {};
-        if (typeof p?.id === 'string' && /^s_[A-Za-z0-9]+$/.test(p.id)) {
+        if (typeof p?.id === 'string' && /^s_[A-Za-z0-9_-]+$/.test(p.id)) {
           hits++;
           continue;
         }
@@ -6334,7 +6344,7 @@ async function renderAnalyzeTable(force = false) {
       if (!p || typeof p !== 'object') return false;
       
       // Check if it has typical post fields
-      if (typeof p?.id === 'string' && /^s_[A-Za-z0-9]+$/.test(p.id)) return true;
+      if (typeof p?.id === 'string' && /^s_[A-Za-z0-9_-]+$/.test(p.id)) return true;
       if (p?.unique_view_count != null || p?.view_count != null) return true;
       if (Array.isArray(p?.attachments) && p.attachments.length) return true;
       
@@ -8082,7 +8092,7 @@ async function renderAnalyzeTable(force = false) {
   function routeKindFromRouteKey(rk) {
     const path = String(rk || '').split('?')[0] || '';
     if (path === '/explore' || path.startsWith('/explore/')) return 'explore';
-    if (/^\/p\/s_[A-Za-z0-9]+/i.test(path)) return 'post';
+    if (/^\/p\/s_[^\/]+/i.test(path)) return 'post';
     return 'other';
   }
 
