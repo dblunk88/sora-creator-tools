@@ -667,10 +667,69 @@
   };
 
   const SCT_MOBILE_AUTOPLAY_DISABLED_ATTR = 'data-sct-mobile-noautoplay';
+  const SCT_MOBILE_PLAY_GUARD_ATTR = 'data-sct-mobile-playguard';
   let sctMobileAutoplayObs = null;
   let sctMobileAutoplayActive = false;
   let sctMobileAutoplayScheduled = false;
   const sctMobileAutoplayPending = new Set();
+
+  let sctMobilePlayPatchInstalled = false;
+  function ensureMobileAutoplayPlayPatch() {
+    if (sctMobilePlayPatchInstalled) return;
+    sctMobilePlayPatchInstalled = true;
+    try {
+      if (typeof HTMLMediaElement !== 'function' || !HTMLMediaElement.prototype) return;
+      const proto = HTMLMediaElement.prototype;
+      const origPlay = proto.play;
+      if (typeof origPlay !== 'function') return;
+      if (origPlay && origPlay.__sct_patched__) return;
+      proto.play = function () {
+        try {
+          // Only hard-block preview autoplay on mobile feed/grid pages.
+          if (shouldDisableMobilePreviewAutoplay() && this && this.tagName === 'VIDEO') {
+            const v = this;
+            if (v && v.getAttribute && v.hasAttribute(SCT_MOBILE_AUTOPLAY_DISABLED_ATTR)) {
+              try { v.pause(); } catch {}
+              try { v.autoplay = false; } catch {}
+              try { v.removeAttribute('autoplay'); } catch {}
+              const P = typeof Promise === 'function' ? Promise : null;
+              return P ? P.resolve() : undefined;
+            }
+          }
+        } catch {}
+        return origPlay.apply(this, arguments);
+      };
+      try {
+        proto.play.__sct_patched__ = true;
+      } catch {}
+    } catch {}
+  }
+
+  function installMobileAutoplayPlayGuard(videoEl) {
+    try {
+      if (!videoEl || videoEl.nodeType !== 1 || videoEl.tagName !== 'VIDEO') return;
+      if (videoEl.hasAttribute(SCT_MOBILE_PLAY_GUARD_ATTR)) return;
+      videoEl.setAttribute(SCT_MOBILE_PLAY_GUARD_ATTR, '1');
+
+      const guard = () => {
+        try {
+          if (!shouldDisableMobilePreviewAutoplay()) return;
+          if (!videoEl.hasAttribute(SCT_MOBILE_AUTOPLAY_DISABLED_ATTR)) return;
+          try { videoEl.pause(); } catch {}
+          try { videoEl.autoplay = false; } catch {}
+          try { videoEl.removeAttribute('autoplay'); } catch {}
+          try { videoEl.loop = false; } catch {}
+          try { videoEl.removeAttribute('loop'); } catch {}
+          try { videoEl.preload = 'none'; } catch {}
+          try { videoEl.setAttribute('preload', 'none'); } catch {}
+        } catch {}
+      };
+
+      // Capture phase so we run before app handlers when possible.
+      videoEl.addEventListener('play', guard, true);
+      videoEl.addEventListener('playing', guard, true);
+    } catch {}
+  }
 
   function disableMobilePreviewAutoplay(videoEl) {
     try {
@@ -685,6 +744,7 @@
       try { videoEl.pause(); } catch {}
       try { videoEl.preload = 'none'; } catch {}
       try { videoEl.setAttribute('preload', 'none'); } catch {}
+      try { installMobileAutoplayPlayGuard(videoEl); } catch {}
     } catch {}
   }
 
@@ -728,6 +788,7 @@
     }
 
     sctMobileAutoplayActive = true;
+    try { ensureMobileAutoplayPlayPatch(); } catch {}
     // Process existing videos once.
     try {
       const vids = document.querySelectorAll ? document.querySelectorAll('video') : [];
@@ -739,6 +800,9 @@
       if (!sctMobileAutoplayActive) return;
       try {
         for (const r of records) {
+          if (r && r.type === 'attributes' && r.target && r.target.nodeType === 1) {
+            sctMobileAutoplayPending.add(r.target);
+          }
           const added = r && r.addedNodes ? r.addedNodes : null;
           if (!added) continue;
           for (const n of added) {
@@ -750,7 +814,13 @@
       scheduleMobileAutoplayProcess();
     });
     try {
-      sctMobileAutoplayObs.observe(document.documentElement, { childList: true, subtree: true });
+      // Also observe attribute changes, since React can toggle autoplay/loop without replacing the node.
+      sctMobileAutoplayObs.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['autoplay', 'loop', 'preload'],
+      });
     } catch {}
   }
 
